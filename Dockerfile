@@ -40,6 +40,7 @@ ENV NODO_DIR=/opt/nodo \
 # kmod for modprobe, e2fsprogs/xfsprogs for storage, pigz/xz for layer (de)compress.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip python3-dev build-essential git ca-certificates \
+        unzip zip \
         iptables iproute2 kmod e2fsprogs xfsprogs pigz xz-utils openssl uidmap \
     && rm -rf /var/lib/apt/lists/*
 

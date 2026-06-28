@@ -44,6 +44,10 @@ if [ ! -e /sys/fs/cgroup/cgroup.controllers ] && ! mountpoint -q /sys/fs/cgroup;
   mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
 fi
 
+# Remove any stale pidfile/socket from a previous boot (e.g. a microVM/container
+# restart) so dockerd doesn't refuse to start with "process N is still running".
+rm -f "${NODO_DIR}/docker/docker.pid" "${NODO_DIR}/docker/docker.sock"
+
 echo "[start] booting in-VM dockerd (vfs) on ${NODO_DIR}/docker/docker.sock ..."
 # --storage-driver=vfs: overlay2 frequently can't mount inside a cloud-hypervisor
 # microVM's root fs; vfs always works (slower/heavier but correct).

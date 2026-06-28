@@ -96,15 +96,24 @@ def _run_packer(zip_path: str):
 
 
 def _serialize_bee(service_dir: str) -> bytes:
-    """Serialise the packer's multiblock directory into the single `.celaut.bee`
-    byte stream — the same stream nodo hashes to derive the service-id."""
+    """Serialise the packer's multiblock directory into a single `.celaut.bee`
+    byte stream in the framing `nodo import` expects: a sequence of
+    buffer_pb2.Buffer messages, each preceded by its length as a 4-byte
+    big-endian integer (see bee_rpc.client write_to_file / reader.read_bee_file).
+
+    read_from_registry walks the multiblock dir and yields the Buffer objects
+    (chunk= for inline bytes, block= for block pointers); we just length-prefix
+    each. Concatenating raw multiblock chunks (the previous approach) is NOT a
+    valid .bee and fails import with "Incomplete message data"."""
     # Imported lazily so the module is importable without the nodo deps present
     # (e.g. for unit-testing the HTTP layer on a dev box).
     sys.path.insert(0, NODO_DIR)
     from bee_rpc import client as grpcbb  # type: ignore
     buf = bytearray()
-    for chunk in grpcbb.read_multiblock_directory(directory=service_dir):
-        buf.extend(chunk)
+    for b in grpcbb.read_from_registry(filename=service_dir):
+        data = b.SerializeToString()
+        buf.extend(len(data).to_bytes(4, "big"))
+        buf.extend(data)
     return bytes(buf)
 
 
