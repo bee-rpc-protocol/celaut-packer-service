@@ -18,10 +18,14 @@ FROM rust:1.83-alpine@sha256:0ac946ed7597a9f053a1be2ce38c09aa88b3d7079a91ea49149
 ENV SOURCE_DATE_EPOCH=0 \
     CARGO_INCREMENTAL=0 \
     RUSTFLAGS="--remap-path-prefix=/build=."
+# NOTE: context COPY sources MUST start with "./". nodo's packer rewrites every
+# `COPY ./X ...` to `COPY service/X ...` (it nests the project under service/ in
+# the build context); a source without the leading "./" is left untouched and
+# then "not found". `COPY --from=<stage>` lines are correctly left alone.
 RUN apk add --no-cache musl-dev
 WORKDIR /build
-COPY Cargo.toml ./
-COPY src ./src
+COPY ./Cargo.toml ./
+COPY ./src ./src
 RUN cargo build --release --offline 2>/dev/null || cargo build --release \
     && cp target/release/hello /hello \
     && strip /hello
