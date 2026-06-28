@@ -42,6 +42,11 @@ mkdir -p "$CACHE" "$BLOCKDIR" \
 # restart) so dockerd doesn't refuse to start with "process N is still running".
 rm -f "${NODO_DIR}/docker/docker.pid" "${NODO_DIR}/docker/docker.sock"
 
+# The CH guest's kernel ip= boot path points resolv.conf at the nodo gateway,
+# but there is no DNS proxy listening there. Use public resolvers over the
+# wildcard egress channel so dockerd itself can resolve registries.
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' >/etc/resolv.conf || true
+
 start_dockerd() {
   local storage_driver="$1"
   echo "[start] booting native dockerd (${storage_driver}) on ${NODO_DIR}/docker/docker.sock ..."
