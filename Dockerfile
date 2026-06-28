@@ -38,6 +38,26 @@ RUN apk update \
 RUN git clone --depth 1 --branch "${NODO_REF}" \
         https://github.com/celaut-project/nodo.git "${NODO_DIR}"
 
+# Determinism patches (REQUIRED so this service's ids match `nodo pack` on a
+# patched node, and so packing the same project twice yields the same id).
+# Upstream nodo's packer is nondeterministic for two reasons:
+#   1. recursive_parsing iterates os.listdir() UNSORTED, so filesystem branch
+#      order (hence the serialized bytes) varies between two extractions of the
+#      same image tar.
+#   2. it hashes mtime_ns, but tar extraction reassigns SYMLINK mtimes to the
+#      current wall-clock time, so the id changes every pack.
+# Both are content-irrelevant; normalise them. (Report upstream.)
+RUN sed -i \
+        's/for b_name in os.listdir(host_dir + directory):/for b_name in sorted(os.listdir(host_dir + directory)):/' \
+        "${NODO_DIR}/src/packers/zip_with_dockerfile.py" \
+    && sed -i \
+        's/mtime_ns=int(stat_result.st_mtime_ns),/mtime_ns=0,/' \
+        "${NODO_DIR}/src/utils/filesystem_xattrs.py" \
+    && grep -q 'sorted(os.listdir(host_dir + directory))' \
+        "${NODO_DIR}/src/packers/zip_with_dockerfile.py" \
+    && grep -q 'mtime_ns=0,' "${NODO_DIR}/src/utils/filesystem_xattrs.py" \
+    && echo "determinism patches applied"
+
 # Install exactly the deps the packer worker (src/packers/zip_with_dockerfile)
 # imports — NOT nodo's full requirements (those drag in the Ergo payment stack:
 # ergpy/jpype1/coincurve/bip32/mnemonic, which need a JVM + libsecp256k1 and are
