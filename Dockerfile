@@ -19,15 +19,19 @@ ENV NODO_DIR=/opt/nodo \
     PYTHONUNBUFFERED=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1
 
-# NOTE: docker:27-dind (Alpine) ships a python3.12 whose pyexpat.so is linked
-# against expat >= 2.7.0 (it references XML_SetAllocTrackerActivationThreshold),
-# but the base image's libexpat can be older — so `import pyexpat` fails and pip
-# itself (xmlrpc -> expat) is unusable until expat is upgraded. Upgrade expat
-# FIRST, in the same layer, before any pip invocation.
-RUN apk add --no-cache \
-        python3 py3-pip git bash tar expat \
+# NOTE: docker:27-dind's baked python3.12 (3.12.13-r0) was built against a
+# NEWER expat than the Alpine v3.21 repo currently ships: its pyexpat.so
+# references XML_SetAllocTrackerActivationThreshold, a symbol the repo's
+# libexpat lacks, so `import pyexpat` fails and pip (xmlrpc -> expat) is
+# unusable. `apk add python3` is a no-op (already installed) so it keeps the
+# mismatched baked build. Force a full `apk upgrade --available` so python3 AND
+# expat are both reconciled to the same consistent v3.21 snapshot, THEN add the
+# rest and sanity-check pyexpat — all before any pip invocation.
+RUN apk update \
+    && apk upgrade --no-cache --available \
+    && apk add --no-cache \
+        python3 py3-pip git bash tar \
         build-base python3-dev libffi-dev openssl-dev \
-    && apk upgrade --no-cache expat \
     && python3 -c "import pyexpat; print('pyexpat ok', pyexpat.EXPAT_VERSION)"
 
 # Vendor the nodo tree (packer + its src.utils / protos / bee_rpc deps).
