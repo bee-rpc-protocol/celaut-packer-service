@@ -38,14 +38,30 @@ RUN apk update \
 RUN git clone --depth 1 --branch "${NODO_REF}" \
         https://github.com/celaut-project/nodo.git "${NODO_DIR}"
 
-# Install the Python deps the packer imports. The nodo repo pins these in its
-# requirements; we install that set plus bee_rpc explicitly. (First real build
-# on an amd64 node will confirm the exact wheel set; adjust here if a transitive
-# dep is missing — this is the one spot that may need a pin tweak.)
-RUN pip3 install --no-cache-dir bee_rpc protobuf grpcio \
-    && if [ -f "${NODO_DIR}/requirements.txt" ]; then \
-         pip3 install --no-cache-dir -r "${NODO_DIR}/requirements.txt" || true ; \
-       fi
+# Install exactly the deps the packer worker (src/packers/zip_with_dockerfile)
+# imports — NOT nodo's full requirements (those drag in the Ergo payment stack:
+# ergpy/jpype1/coincurve/bip32/mnemonic, which need a JVM + libsecp256k1 and are
+# never imported by the packer).
+#
+# Two pins matter for a byte-identical service-id:
+#   * protobuf==4.23.3 — the metadata serializer; matches the node's runtime and
+#     the protoc that generated nodo's vendored protos/*_pb2.py.
+#   * bee_rpc @ the exact git commit the node uses — owns the multiblock/.bee
+#     block format that the id is hashed over.
+# bee_rpc HARD-pins grpcio==1.56.0 + protobuf==4.23.3 in its metadata, but
+# grpcio 1.56.0 has no cp312/musllinux wheel and would force a slow, fragile
+# source build. grpcio is only the block-streaming transport underneath bee_rpc
+# — it contributes no bytes to the hashed content — so we install bee_rpc with
+# --no-deps and supply a wheel-shipping grpcio ourselves, while keeping protobuf
+# pinned exactly.
+RUN pip3 install --no-cache-dir \
+        "protobuf==4.23.3" "grpcio" \
+        "docker==6.1.3" requests requests-unixsocket "PyYAML==6.0.1" \
+        "python-dotenv==1.0.0" psutil netifaces2 tabulate packaging \
+        typing_extensions six \
+    && pip3 install --no-cache-dir --no-deps \
+        "git+https://github.com/bee-rpc-protocol/bee-rpc-over-grpc-py@7a2a344bc29546328bcf2f753dc2407f2c226376" \
+    && python3 -c "from bee_rpc import client; import google.protobuf; print('deps ok, protobuf', google.protobuf.__version__)"
 
 # --- Application --------------------------------------------------------------
 WORKDIR /app
