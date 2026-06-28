@@ -19,9 +19,16 @@ ENV NODO_DIR=/opt/nodo \
     PYTHONUNBUFFERED=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1
 
+# NOTE: docker:27-dind (Alpine) ships a python3.12 whose pyexpat.so is linked
+# against expat >= 2.7.0 (it references XML_SetAllocTrackerActivationThreshold),
+# but the base image's libexpat can be older — so `import pyexpat` fails and pip
+# itself (xmlrpc -> expat) is unusable until expat is upgraded. Upgrade expat
+# FIRST, in the same layer, before any pip invocation.
 RUN apk add --no-cache \
-        python3 py3-pip git bash tar \
-        build-base python3-dev libffi-dev openssl-dev
+        python3 py3-pip git bash tar expat \
+        build-base python3-dev libffi-dev openssl-dev \
+    && apk upgrade --no-cache expat \
+    && python3 -c "import pyexpat; print('pyexpat ok', pyexpat.EXPAT_VERSION)"
 
 # Vendor the nodo tree (packer + its src.utils / protos / bee_rpc deps).
 RUN git clone --depth 1 --branch "${NODO_REF}" \
