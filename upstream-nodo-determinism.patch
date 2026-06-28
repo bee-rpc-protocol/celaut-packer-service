@@ -1,0 +1,75 @@
+Make `nodo pack` deterministic (reproducible service-ids)
+
+Problem
+-------
+`nodo pack <project>` can produce a different service-id every run for the same
+input. Two independent, additive sources of nondeterminism in the packer:
+
+1. Unsorted directory walk. `recursive_parsing` iterates `os.listdir()`, whose
+   order is filesystem/inode-dependent, so the protobuf `Filesystem` branch
+   order (and therefore the content hash) varies between extractions of the
+   same rootfs.
+
+2. Symlink mtimes. The packer hashes `st_mtime_ns` of every rootfs entry. Python's
+   `tarfile` restores regular-file mtimes from the tar on extract, but does NOT
+   apply `os.utime(follow_symlinks=False)` to symlinks — so every extracted
+   symlink gets the wall-clock time of extraction. Each `nodo pack` re-extracts
+   the buildx tar, re-stamping symlink mtimes, so the id changes every run even
+   for a fully reproducible image whose symlinks were `touch -h -d @0`'d at build.
+
+Evidence (examples-style static service, packed twice each on one box):
+  - unsorted+raw-mtime : 4d106a3a… vs b6c28f01…   NONDETERMINISTIC
+  - sorted + symlink-mtime-normalized : b908c02b… == b908c02b…   DETERMINISTIC
+
+Minimal-mechanism proof (CPython tarfile): a tar entry written with mtime=0
+extracts as mtime_ns=0 for a regular file (stable across extracts) but as the
+current wall-clock for a symlink (different every extract).
+
+Fix
+---
+1. Sort the directory walk: `sorted(os.listdir(...))`. Clearly correct; order
+   must not affect identity.
+
+2. Normalize ONLY symlink mtimes to 0. This is the surgical fix: it neutralizes
+   exactly the value that `tarfile` randomizes, while leaving regular-file/dir
+   mtimes (which extract deterministically) as legitimate hashed content. An
+   alternative — zeroing mtime_ns for ALL entries — also yields determinism but
+   is more invasive than the bug requires; symlink-only is sufficient and is
+   recommended here. (Choosing all-zero vs symlink-only changes the resulting id
+   value, so it must be decided once and applied consistently.)
+
+Note: a third, separate determinism factor exists in deployments — protobuf map
+(xattrs) serialization order can differ between the C (upb) and pure-python
+implementations. The robust upstream fix is to serialize maps deterministically
+(`SerializeToString(deterministic=True)`) wherever the packer emits the metadata
+buffer; pinning `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python` is only a
+workaround. Not included in the diff below since it depends on where you prefer
+to enforce deterministic serialization.
+
+---
+diff --git a/src/packers/zip_with_dockerfile.py b/src/packers/zip_with_dockerfile.py
+index 399cedb2..c831f2de 100644
+--- a/src/packers/zip_with_dockerfile.py
++++ b/src/packers/zip_with_dockerfile.py
+@@ -202,7 +202,7 @@ class ZipContainerPacker:
+             def recursive_parsing(directory: str) -> celaut.Service.Container.Filesystem:
+                 host_dir = CACHE + self.aux_id + "/filesystem"
+                 filesystem = celaut.Service.Container.Filesystem()
+-                for b_name in os.listdir(host_dir + directory):
++                for b_name in sorted(os.listdir(host_dir + directory)):
+                     if b_name == '.wh..wh..opq':
+                         # https://github.com/opencontainers/image-spec/blob/master/layer.md#opaque-whiteout
+                         continue
+diff --git a/src/utils/filesystem_xattrs.py b/src/utils/filesystem_xattrs.py
+index c3b2b970..91ab02e6 100644
+--- a/src/utils/filesystem_xattrs.py
++++ b/src/utils/filesystem_xattrs.py
+@@ -81,7 +81,7 @@ def metadata_from_lstat(stat_result: os.stat_result) -> FilesystemNodeMetadata:
+         mode=mode,
+         uid=int(stat_result.st_uid),
+         gid=int(stat_result.st_gid),
+-        mtime_ns=int(stat_result.st_mtime_ns),
++        mtime_ns=(0 if stat.S_ISLNK(mode) else int(stat_result.st_mtime_ns)),  # tarfile re-stamps symlink mtimes to wall-clock on each extract; regular-file mtimes are restored from the tar and stay deterministic
+         device_major=device_major,
+         device_minor=device_minor,
+         device_is_block=device_is_block,
