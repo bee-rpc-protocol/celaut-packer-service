@@ -1,0 +1,156 @@
+commit 91a508a3d3e5a181d9d566d8077200de228f0a1d
+Author:     root <root@DESKTOP-ILFBAO6.localdomain>
+AuthorDate: Sun Jun 28 14:49:01 2026 -0400
+Commit:     root <root@DESKTOP-ILFBAO6.localdomain>
+CommitDate: Sun Jun 28 14:49:01 2026 -0400
+
+    Allow wildcard network tag egress
+---
+ src/manager/networks.py             |  9 +++++++++
+ src/virtualizers/ch/execute.py      | 12 ++++++++++++
+ src/virtualizers/ch/firewall.py     | 24 ++++++++++++++++++++++++
+ src/virtualizers/docker/firewall.py | 18 ++++++++++++++++++
+ src/virtualizers/firewall.py        | 15 +++++++++++++++
+ 5 files changed, 78 insertions(+)
+
+diff --git a/src/manager/networks.py b/src/manager/networks.py
+index 9a6a2169..e368626e 100644
+--- a/src/manager/networks.py
++++ b/src/manager/networks.py
+@@ -52,6 +52,10 @@ def resolve_ergo_network() -> List[celaut.Instance.Uri]:
+         return []
+ 
+ def resolve_network(network: celaut.Service.Network) -> List[celaut.Instance]:
++    # Wildcard "*" (open-internet egress) and any unresolved tag resolve to no
++    # concrete peer instances; initialise uris so an unmatched loop cannot raise
++    # UnboundLocalError (it previously did for tag "*").
++    uris: List[celaut.Instance.Uri] = []
+     for tag in network.tags:
+         if "ergo" in tag:
+             uris = resolve_ergo_network()
+@@ -65,6 +69,11 @@ def resolve_network(network: celaut.Service.Network) -> List[celaut.Instance]:
+         if uris:
+             break
+ 
++    if not uris:
++        # No concrete peer URIs (e.g. wildcard "*"): the tag is honoured at the
++        # firewall layer (allow-all egress); there is no peer instance to advertise.
++        return []
++
+     client_protocol_stack = network.protocol_stack
+     i_slot = 1  # Default slot id (because internal port usage is irrelevant here)
+ 
+diff --git a/src/virtualizers/ch/execute.py b/src/virtualizers/ch/execute.py
+index 2a0ed8dd..fbfc403c 100644
+--- a/src/virtualizers/ch/execute.py
++++ b/src/virtualizers/ch/execute.py
+@@ -29,6 +29,7 @@ from src.virtualizers.firewall import (
+     allow_connection as vm_allow_connection,
+     allow_connection_to_instance as vm_allow_connection_to_instance,
+     block_all as vm_block_all,
++    allow_all_egress as vm_allow_all_egress,
+     resolve_slot_transport_protocols,
+ )
+ 
+@@ -811,6 +812,17 @@ def _configure_guest_firewall_policy(
+         f"[CH][{vmachine_id}] firewall allow DNS: {vm_ip} -> {NETWORK_GATEWAY_IP}:53/tcp,udp"
+     )
+ 
++    # Network tag "*" => open-internet egress. Allow-all is inserted at the head
++    # of FORWARD so it takes precedence over the default-deny block_all rule.
++    if any(tag == "*" for net_res in network_resolution for tag in net_res.tags):
++        if not vm_allow_all_egress(vmachine_id=vmachine_id, source_ip=vm_ip):
++            raise CHExecuteError(
++                f"Failed to apply allow-all egress (network tag '*') for VM {vmachine_id} ({vm_ip})."
++            )
++        log.LOGGER(
++            f"[CH][{vmachine_id}] firewall allow-all egress (network tag '*')"
++        )
++
+     for net_res in network_resolution:
+         tag = net_res.tags[0] if net_res.tags else "<untagged>"
+         rule_applied = False
+diff --git a/src/virtualizers/ch/firewall.py b/src/virtualizers/ch/firewall.py
+index d812cdac..4938eff2 100644
+--- a/src/virtualizers/ch/firewall.py
++++ b/src/virtualizers/ch/firewall.py
+@@ -224,3 +224,27 @@ def remove_rule(
+     except Exception as e:
+         logger(f"[CH][FW] Failed to remove rule for {vmachine_id}: {e}")
+         return False
++
++def allow_all_egress(vmachine_id: str, source_ip: Optional[str] = None) -> bool:
++    """Allow ALL outbound traffic from the VM (used for network tag '*').
++
++    Inserted at the head of FORWARD so it short-circuits the block_all DROP rule.
++    Return traffic is covered by the global ESTABLISHED/RELATED accept rule.
++    """
++    try:
++        vm_ip = _resolve_vmachine_ip(vmachine_id=vmachine_id, source_ip=source_ip)
++        success, message = _execute_iptables([
++            "-I", "FORWARD",
++            "-s", vm_ip,
++            "-m", "comment",
++            "--comment", f"nodo;allow_all_egress;vm={vmachine_id}",
++            "-j", "ACCEPT",
++        ])
++        if success:
++            logger(f"[CH][FW] Allowed ALL egress for {vmachine_id} ({vm_ip}) [network tag '*']")
++        else:
++            logger(f"[CH][FW] Failed to allow all egress for {vmachine_id} ({vm_ip}): {message}")
++        return success
++    except Exception as e:
++        logger(f"[CH][FW] Failed to allow all egress for {vmachine_id}: {e}")
++        return False
+diff --git a/src/virtualizers/docker/firewall.py b/src/virtualizers/docker/firewall.py
+index 1a4a44c0..5c024215 100644
+--- a/src/virtualizers/docker/firewall.py
++++ b/src/virtualizers/docker/firewall.py
+@@ -228,3 +228,21 @@ def list_rules(container_id: str) -> List[NetworkRule]:
+     except Exception as e:
+         logger(f"Failed to list rules: {e}")
+         return []
++
++def allow_all_egress(container_id: str) -> bool:
++    """Allow ALL outbound traffic from a container (network tag '*')."""
++    try:
++        container_ip = __get_container_ip(container_id)
++        success, message = __execute_iptables([
++            '-I', 'FORWARD',
++            '-s', container_ip,
++            '-j', 'ACCEPT',
++        ])
++        if success:
++            logger(f"Allowed ALL egress for container {container_id} [network tag '*']")
++        else:
++            logger(f"Failed to allow all egress for container {container_id}: {message}")
++        return success
++    except Exception as e:
++        logger(f"Failed to allow all egress: {e}")
++        return False
+diff --git a/src/virtualizers/firewall.py b/src/virtualizers/firewall.py
+index 97855276..6fb3d30e 100644
+--- a/src/virtualizers/firewall.py
++++ b/src/virtualizers/firewall.py
+@@ -302,6 +302,21 @@ def block_all(vmachine_id: str, source_ip: Optional[str] = None) -> bool:
+     raise ValueError(f"Unknown virtualizer for instance {vmachine_id}")
+ 
+ 
++def allow_all_egress(vmachine_id: str, source_ip: Optional[str] = None) -> bool:
++    virtualizer = _resolve_virtualizer(vmachine_id)
++    if virtualizer == "ch":
++        from src.virtualizers.ch.firewall import allow_all_egress as ch_allow_all_egress
++
++        return ch_allow_all_egress(vmachine_id=vmachine_id, source_ip=source_ip)
++
++    if virtualizer == "docker":
++        from src.virtualizers.docker.firewall import allow_all_egress as docker_allow_all_egress
++
++        return docker_allow_all_egress(container_id=vmachine_id)
++
++    raise ValueError(f"Unknown virtualizer for instance {vmachine_id}")
++
++
+ def remove_rule(
+     vmachine_id: str,
+     ip: str,
