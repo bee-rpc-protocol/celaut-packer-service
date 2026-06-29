@@ -21,13 +21,19 @@ API (bound on 0.0.0.0:8080):
                                     headers: X-Service-Id: <hex>
                                              Content-Disposition: attachment;
                                                  filename="<service_id>.celaut.bee"
-                             400 -> packing/validation error (text body)
+                             400 -> config or packing error (text body). The
+                                    .service configuration is validated up front
+                                    (valid JSON, architecture, entrypoint, api
+                                    slots, pack_config) and any problems are
+                                    returned as a numbered, plain-English list
+                                    pointing at SERVICE_CONFIG_GUIDE.md, so a bad
+                                    config never reaches a cryptic build failure.
                              415 -> bad/missing zip
 
 The zip must contain (at its root, or in a single top-level folder):
-  - Dockerfile
-  - service.json
-  - pack_config.json   (optional; honoured by the nodo packer's ignore globs)
+  - Dockerfile           (root or .service/)
+  - service.json         (root or .service/)
+  - pack_config.json     (optional; honoured by the nodo packer's ignore globs)
 """
 import base64
 import json
@@ -43,6 +49,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 NODO_DIR = os.environ.get("NODO_DIR", "/opt/nodo")
 PORT = int(os.environ.get("PORT", "8080"))
 MAX_ZIP_BYTES = int(os.environ.get("MAX_ZIP_BYTES", str(512 * 1024 * 1024)))  # 512MB
+# This packer microVM builds on an amd64 host with no cross-compilation set up,
+# so it can only pack linux/amd64 services. Surfaced in config validation.
+SUPPORTED_ARCH = os.environ.get("PACKER_ARCH", "linux/amd64")
+GUIDE = "SERVICE_CONFIG_GUIDE.md"
 
 # The nodo ConfigManager reads these; start.sh exports them too. Kept here so the
 # server is runnable/inspectable on its own.
@@ -57,6 +67,126 @@ def _has_config(project: str, name: str) -> bool:
     return os.path.exists(os.path.join(project, name)) or os.path.exists(
         os.path.join(project, ".service", name)
     )
+
+
+def _locate_config(project: str, name: str):
+    """Return the path the packer will actually use for a config file. nodo's
+    prepare_directory prefers .service/ when that dir exists, else the project
+    root. Returns None if the file is in neither place."""
+    svc = os.path.join(project, ".service", name)
+    root = os.path.join(project, name)
+    if os.path.isdir(os.path.join(project, ".service")) and os.path.exists(svc):
+        return svc
+    if os.path.exists(root):
+        return root
+    if os.path.exists(svc):
+        return svc
+    return None
+
+
+def _load_json(path: str):
+    """Return (obj, None) on success, or (None, "human-readable error") if the
+    file isn't valid JSON. Reports the exact line/column of a syntax error."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f), None
+    except json.JSONDecodeError as e:
+        return None, f"{e.msg} (line {e.lineno}, column {e.colno})"
+    except OSError as e:
+        return None, str(e)
+
+
+def _validate_service_config(project: str):
+    """Pre-flight check of the .service configuration. Returns a list of
+    plain-English problems ("what's wrong + how to fix"). An empty list means the
+    config is structurally sound (the Docker build may still fail for other
+    reasons, which are surfaced separately with the build log)."""
+    problems = []
+
+    sj_path = _locate_config(project, "service.json")
+    if not sj_path:  # caller already guards this, but stay defensive
+        return ["service.json is missing (expected at the project root or in a "
+                ".service/ folder)."]
+
+    sj, err = _load_json(sj_path)
+    if err:
+        return [f"service.json is not valid JSON — {err}. Common causes: a "
+                "trailing comma, a missing comma, or unquoted keys/strings. Fix "
+                "the syntax and re-pack."]
+    if not isinstance(sj, dict):
+        return [f"service.json must be a JSON object {{ ... }}, not a "
+                f"{type(sj).__name__}."]
+
+    # architecture — required, and this host only builds amd64.
+    arch = sj.get("architecture")
+    if not arch:
+        problems.append(
+            f'"architecture" is required in service.json. Add '
+            f'"architecture": "{SUPPORTED_ARCH}". ({GUIDE} → architecture)')
+    elif not isinstance(arch, str):
+        problems.append(f'"architecture" must be a string like "{SUPPORTED_ARCH}", '
+                        f'not {type(arch).__name__}.')
+    elif arch != SUPPORTED_ARCH:
+        problems.append(
+            f'architecture "{arch}" can\'t be built by this packer — it runs on '
+            f'a {SUPPORTED_ARCH} host with no cross-compilation. Set '
+            f'"architecture": "{SUPPORTED_ARCH}".')
+
+    # entrypoint — init.entry_path (preferred) or the legacy "entrypoint" field.
+    init = sj.get("init")
+    entry = init.get("entry_path") if isinstance(init, dict) else None
+    if not entry and not sj.get("entrypoint"):
+        problems.append(
+            'no entrypoint declared — the service has nothing to run. Add '
+            '"init": { "entry_path": ["app", "start.sh"] } pointing at the '
+            f'executable/script inside your image. ({GUIDE} → init)')
+    elif entry is not None and not isinstance(entry, (str, list)):
+        problems.append('init.entry_path must be a string ("app/start.sh") or an '
+                        'array of segments (["app", "start.sh"]).')
+
+    # api slots — optional, but validate shape when present.
+    api = sj.get("api")
+    if api is not None:
+        if not isinstance(api, list):
+            problems.append('"api" must be an array of slot objects, e.g. '
+                            '[ { "port": 8080, "protocol": ["http"] } ].')
+        else:
+            for i, slot in enumerate(api):
+                if not isinstance(slot, dict):
+                    problems.append(f'api[{i}] must be an object with at least a '
+                                    '"port".')
+                    continue
+                port = slot.get("port")
+                if not isinstance(port, int) or isinstance(port, bool):
+                    problems.append(f'api[{i}].port must be an integer (got '
+                                    f'{port!r}).')
+                elif not 1 <= port <= 65535:
+                    problems.append(f'api[{i}].port {port} is out of range '
+                                    '(1–65535).')
+                if "protocol" not in slot:
+                    problems.append(f'api[{i}] has no "protocol" — add e.g. '
+                                    '"protocol": ["http"] or ["grpc"].')
+
+    # network — optional.
+    if sj.get("network") is not None and not isinstance(sj["network"], list):
+        problems.append('"network" must be an array of { "tags": [...], '
+                        '"prose": "..." } entries.')
+
+    # pack_config.json — optional; validate JSON + the dependencies_env/array trap.
+    pc_path = _locate_config(project, "pack_config.json")
+    if pc_path:
+        pc, perr = _load_json(pc_path)
+        if perr:
+            problems.append(f"pack_config.json is not valid JSON — {perr}.")
+        elif isinstance(pc, dict) and pc.get("dependencies_env") and isinstance(
+            pc.get("dependencies"), list
+        ):
+            problems.append(
+                '"dependencies_env": true requires "dependencies" to be an object '
+                '(NAME → path), not an array, so each dependency gets an env-var '
+                f'name. ({GUIDE} → dependencies_env)')
+
+    return problems
 
 
 def _flatten_single_root(extract_dir: str) -> str:
@@ -178,9 +308,27 @@ class Handler(BaseHTTPRequestHandler):
                 zf.extractall(extract_dir)
             project = _flatten_single_root(extract_dir)
             if not _has_config(project, "service.json"):
-                return self._send(400, "zip missing service.json (root or .service/)")
+                return self._send(400,
+                    "No service.json found. Every service needs a service.json "
+                    "(at the project root or in a .service/ folder) declaring its "
+                    f"architecture, entrypoint, ports and network. See {GUIDE}.")
             if not _has_config(project, "Dockerfile"):
-                return self._send(400, "zip missing Dockerfile (root or .service/)")
+                return self._send(400,
+                    "No Dockerfile found. The packer builds your service's "
+                    "filesystem from a Dockerfile (at the project root or in a "
+                    f".service/ folder). See {GUIDE} → Dockerfile.")
+
+            # Pre-flight: explain any .service config mistakes before building, so
+            # users get an actionable message instead of a cryptic build failure.
+            problems = _validate_service_config(project)
+            if problems:
+                body = (
+                    "Your .service configuration has "
+                    f"{len(problems)} problem{'s' if len(problems) != 1 else ''}:\n\n"
+                    + "\n".join(f"  {i}. {p}" for i, p in enumerate(problems, 1))
+                    + f"\n\nFix and re-pack. Full field reference: {GUIDE}."
+                )
+                return self._send(400, body)
 
             # Re-zip the (possibly flattened) project for the worker, which unzips
             # to its own cache. Mirrors nodo's zipfile_ok contract.
@@ -204,7 +352,13 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
         except RuntimeError as e:
-            return self._send(400, f"pack failed: {e}")
+            return self._send(400,
+                "Packing failed while building your service:\n\n"
+                f"{e}\n\n"
+                "This is usually a Docker build error, not a config-shape problem. "
+                "Common causes: a COPY referencing a file that isn't in the build "
+                "context, a base image that can't be pulled, or a RUN step that "
+                f"exits non-zero. See {GUIDE} → Common Issues.")
         except Exception as e:  # noqa: BLE001 - surface unexpected failures
             return self._send(500, f"internal error: {e}")
         finally:

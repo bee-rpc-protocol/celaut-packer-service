@@ -24,9 +24,24 @@ Bound on `0.0.0.0:8080` (declared in `service.json`).
 | GET    | `/health` | —                   | `200 ok` |
 | POST   | `/pack`   | project `.zip`      | `200` → `application/octet-stream` (`.celaut.bee`); header `X-Service-Id: <hex>`; `Content-Disposition: attachment; filename="<id>.celaut.bee"` |
 
-Errors: `415` (not a zip), `400` (missing `service.json`/`Dockerfile`, or a
-packer/validation error with the message in the body), `413` (too large), `500`
-(unexpected).
+Errors: `415` (not a zip), `400` (config or packing error), `413` (too large),
+`500` (unexpected).
+
+**Config validation:** before building, the `.service` configuration is checked
+and any problems are returned as a numbered, plain-English list (invalid JSON
+with line/column, missing/wrong `architecture`, no entrypoint, malformed `api`
+slots, the `dependencies_env`+array trap, …) pointing at `SERVICE_CONFIG_GUIDE.md`.
+A bad config gets an actionable message instead of a cryptic Docker build
+failure. Example body:
+
+```
+Your .service configuration has 2 problems:
+
+  1. "architecture" is required in service.json. Add "architecture": "linux/amd64". (SERVICE_CONFIG_GUIDE.md → architecture)
+  2. no entrypoint declared — the service has nothing to run. Add "init": { "entry_path": ["app", "start.sh"] } ...
+
+Fix and re-pack. Full field reference: SERVICE_CONFIG_GUIDE.md.
+```
 
 The zip must contain, at its root **or** inside a single top-level folder:
 `Dockerfile`, `service.json`, and optionally `pack_config.json`.
