@@ -102,6 +102,24 @@ fi
 docker buildx inspect "$BUILDX_BUILDER" --bootstrap >/dev/null 2>&1 || true
 echo "[start] buildx builder '$BUILDX_BUILDER' ready."
 
+# --- qemu/binfmt for cross-arch (arm64) emulation ----------------------------
+# The packer host is amd64; to ALSO pack linux/arm64 services it must emulate
+# arm. Register qemu binfmt handlers in the (DinD) kernel so buildx/buildkit
+# can build linux/arm64. tonistiigi/binfmt installs static qemu interpreters +
+# binfmt_misc entries; pulls over the service's network: tag=(*) egress.
+# Idempotent; gated by PACKER_ENABLE_QEMU (default on).
+if [ "${PACKER_ENABLE_QEMU:-1}" = "1" ]; then
+  if docker run --privileged --rm tonistiigi/binfmt --install arm64 \
+       >/var/log/binfmt.log 2>&1; then
+    echo "[start] qemu binfmt arm64 registered:"
+    ls /proc/sys/fs/binfmt_misc/ 2>/dev/null | grep -i 'qemu-aarch64' \
+      | sed 's/^/[start]   /' || echo "[start]   (handler not visible in binfmt_misc)"
+  else
+    echo "[start] WARN: qemu binfmt install failed — arm64 packing unavailable." >&2
+    tail -n 20 /var/log/binfmt.log >&2 || true
+  fi
+fi
+
 # --- Browser IDE (code-server) ------------------------------------------------
 # Serve a full VS Code on :8443 so users can pick a language template, edit, and
 # pack inside this same microVM. Access is mediated by the nodo network/DNAT

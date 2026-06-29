@@ -49,9 +49,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 NODO_DIR = os.environ.get("NODO_DIR", "/opt/nodo")
 PORT = int(os.environ.get("PORT", "8080"))
 MAX_ZIP_BYTES = int(os.environ.get("MAX_ZIP_BYTES", str(512 * 1024 * 1024)))  # 512MB
-# This packer microVM builds on an amd64 host with no cross-compilation set up,
-# so it can only pack linux/amd64 services. Surfaced in config validation.
-SUPPORTED_ARCH = os.environ.get("PACKER_ARCH", "linux/amd64")
+# The packer service itself runs on an amd64 host (Alienware, amd64+KVM). With
+# qemu/binfmt registered in the in-VM Docker (see start.sh), buildx can ALSO
+# emulate arm64 — so this packer builds amd64 natively and arm64 via emulation.
+PACKER_ARCH = os.environ.get("PACKER_ARCH", "linux/amd64")  # default suggested in errors
+SUPPORTED_ARCHES = {
+    a.strip() for a in os.environ.get(
+        "PACKER_ARCHES", "linux/amd64,linux/arm64").split(",") if a.strip()
+}
 GUIDE = "SERVICE_CONFIG_GUIDE.md"
 
 # The nodo ConfigManager reads these; start.sh exports them too. Kept here so the
@@ -117,20 +122,21 @@ def _validate_service_config(project: str):
         return [f"service.json must be a JSON object {{ ... }}, not a "
                 f"{type(sj).__name__}."]
 
-    # architecture — required, and this host only builds amd64.
+    # architecture — required. Builds amd64 natively and arm64 via qemu/binfmt.
     arch = sj.get("architecture")
+    supported = ", ".join(sorted(SUPPORTED_ARCHES))
     if not arch:
         problems.append(
-            f'"architecture" is required in service.json. Add '
-            f'"architecture": "{SUPPORTED_ARCH}". ({GUIDE} → architecture)')
+            f'"architecture" is required in service.json. Add e.g. '
+            f'"architecture": "{PACKER_ARCH}" (one of: {supported}). '
+            f'({GUIDE} → architecture)')
     elif not isinstance(arch, str):
-        problems.append(f'"architecture" must be a string like "{SUPPORTED_ARCH}", '
+        problems.append(f'"architecture" must be a string like "{PACKER_ARCH}", '
                         f'not {type(arch).__name__}.')
-    elif arch != SUPPORTED_ARCH:
+    elif arch not in SUPPORTED_ARCHES:
         problems.append(
-            f'architecture "{arch}" can\'t be built by this packer — it runs on '
-            f'a {SUPPORTED_ARCH} host with no cross-compilation. Set '
-            f'"architecture": "{SUPPORTED_ARCH}".')
+            f'architecture "{arch}" can\'t be built by this packer. '
+            f'Supported: {supported}.')
 
     # entrypoint — init.entry_path (preferred) or the legacy "entrypoint" field.
     init = sj.get("init")
