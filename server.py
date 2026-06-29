@@ -49,9 +49,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 NODO_DIR = os.environ.get("NODO_DIR", "/opt/nodo")
 PORT = int(os.environ.get("PORT", "8080"))
 MAX_ZIP_BYTES = int(os.environ.get("MAX_ZIP_BYTES", str(512 * 1024 * 1024)))  # 512MB
-# The packer service itself runs on an amd64 host (Alienware, amd64+KVM). With
-# qemu/binfmt registered in the in-VM Docker (see start.sh), buildx can ALSO
-# emulate arm64 — so this packer builds amd64 natively and arm64 via emulation.
+# The packer service itself runs on an amd64 host. With qemu/binfmt registered
+# in the in-VM Docker (see start.sh), buildx can ALSO emulate arm64 — so this
+# packer builds amd64 natively and arm64 via emulation.
 PACKER_ARCH = os.environ.get("PACKER_ARCH", "linux/amd64")  # default suggested in errors
 SUPPORTED_ARCHES = {
     a.strip() for a in os.environ.get(

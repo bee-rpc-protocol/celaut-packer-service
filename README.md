@@ -83,6 +83,21 @@ builder, then runs `server.py`. **This is why the service declares
 `network: tag=(*)`** — buildx must reach arbitrary container registries to pull
 the base images referenced by the Dockerfile being packed.
 
+### Multi-arch (amd64 + arm64 via qemu)
+
+The packer runs on an **amd64 host**, but it can pack services for **both
+`linux/amd64` and `linux/arm64`**. After the in-VM dockerd is up, `start.sh`
+registers qemu `binfmt_misc` handlers (`tonistiigi/binfmt --install arm64`,
+pulled over the `tag=(*)` egress) so `buildx` can build arm64 images under
+emulation. The target architecture is taken from each service's
+`service.json` `"architecture"` field; supported values are configured via
+`PACKER_ARCHES` (default `linux/amd64,linux/arm64`) and qemu registration can be
+disabled with `PACKER_ENABLE_QEMU=0`.
+
+Crucially, **arm-via-qemu builds stay deterministic**: the content-addressed
+`service_id` is byte-identical across repeated packs of the same arm64 input, so
+emulation does not weaken the packing contract.
+
 ## Browser IDE (code-server)
 
 The image also installs **code-server** (VS Code in the browser), served on the
@@ -123,23 +138,45 @@ happens inside one sealed microVM.
 
 The acceptance test from the brief is a two-step bootstrap:
 
-1. **Pack the packer with the node.** On the amd64 node (Alienware WSL2):
-   `nodo pack workspace/celaut-packer-service` → `celaut-packer-service` gets a
+1. **Pack the packer with the node.** On an amd64 + KVM node:
+   `nodo pack celaut-packer-service` → `celaut-packer-service` gets a
    real service-id; `nodo execute` it to get a running instance with an IP.
 2. **Pack another service with the packer.** Zip e.g. `examples/hello` (or
    `celaut-sat-solver`) and `POST /pack` it to the running packer instance. The
    returned `.celaut.bee` / `X-Service-Id` must match what `nodo pack` produces
    for the same project. `nodo import <id>.celaut.bee` should accept it.
 
-## Status & the one open risk
+## Validation status
 
-- Scaffold complete; `server.py` HTTP/zip layer is unit-tested locally.
-- **End-to-end (build + real `.bee` + dogfood) can only run on an amd64 + KVM
-  node** — this Mac is aarch64 with no KVM. That validation runs on Alienware.
-- **Open risk:** whether a cloud-hypervisor microVM permits a nested Docker
-  daemon (DinD needs privileged/overlay/iptables). If Celaut's runtime forbids
-  it, the fix is localised to `start.sh` + `Dockerfile` — swap DinD for talking
-  to the host nodo's dockerd socket — while `server.py` and the packing contract
-  stay the same.
-- The Python dep set in the `Dockerfile` (bee_rpc + nodo requirements) is the
-  other spot that may need a pin tweak on the first real amd64 build.
+Verified end-to-end on an amd64 + KVM host, running the packer as a privileged
+Docker-in-Docker container:
+
+- **amd64 dogfood — node == service.** `nodo pack examples/hello` and the
+  service's `POST /pack` produce the **same** `service_id`
+  (`8eff6cd8…a79d26c7`), deterministically on both legs.
+- **arm64 via qemu — deterministic.** With qemu `binfmt` registered, the same
+  `linux/arm64` project packed repeatedly yields a **byte-identical**
+  `service_id` (`8783b238…2d0e65be`) and identical `.bee` size each run —
+  emulation does not introduce non-determinism.
+
+Determinism depends on two upstream-nodo fixes that are vendored into the
+packer's nodo clone (otherwise packing is non-reproducible):
+
+1. **sorted directory walk** — `recursive_parsing` must iterate `os.listdir()`
+   sorted, so branch order is stable across extractions.
+2. **zeroed symlink mtime** — `filesystem_xattrs.metadata_from_lstat` must hash
+   `mtime_ns = 0`; `tarfile` otherwise reassigns symlink mtimes to wall-clock on
+   every extract.
+
+protobuf must be the **pure-python** implementation on both legs (the `upb`
+C backend has unstable map ordering across runs).
+
+### Notes & remaining work
+
+- **Execution target.** The proven path runs the packer as a privileged DinD
+  container. Running it inside a sealed cloud-hypervisor microVM additionally
+  requires the runtime to allow a nested Docker daemon (privileged / overlay /
+  netfilter) and egress for `buildx` to pull base images.
+- **Open cross-check.** arm64 is proven *service-self-deterministic* (repeat
+  packs match); the node-side `nodo pack` arm64 == service cross-check is still
+  to be closed (register qemu on the host docker, then compare to `8783b238…`).
