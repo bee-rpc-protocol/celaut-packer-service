@@ -18,7 +18,7 @@
   ],
   "resources": {
     "at_init": {
-      "mem_limit": 536870912,
+      "mem_limit": 4294967296,
       "disk_space": 21474836480
     },
     "at_most": {
