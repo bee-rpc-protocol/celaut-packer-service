@@ -419,26 +419,53 @@ def _run_packer(zip_path: str):
     )
 
 
-def _serialize_bee(service_dir: str) -> bytes:
-    """Serialise the packer's multiblock directory into a single `.celaut.bee`
-    byte stream in the framing `nodo import` expects: a sequence of
-    buffer_pb2.Buffer messages, each preceded by its length as a 4-byte
-    big-endian integer (see bee_rpc.client write_to_file / reader.read_bee_file).
+def _serialize_bee(service_dir: str, metadata_bytes: bytes) -> bytes:
+    """Serialise the packed service as a two-index `[Metadata, Service]`
+    `.celaut.bee` — the exact framing `nodo import` expects.
 
-    read_from_registry walks the multiblock dir and yields the Buffer objects
-    (chunk= for inline bytes, block= for block pointers); we just length-prefix
-    each. Concatenating raw multiblock chunks (the previous approach) is NOT a
-    valid .bee and fails import with "Incomplete message data"."""
+    nodo's `import_bee` reads the stream with
+    `read_from_file(indices={1: Metadata, 2: Service})` and unconditionally
+    consumes BOTH blocks (`next(it)` twice), so a service-only bee makes it raise
+    `StopIteration` and abort the whole pack/import. We mirror nodo's own
+    `export_bee` writer: hand `write_to_file` a generator that yields the metadata
+    block first, then the service directory, under the same
+    `{1: Metadata, 2: Service}` indices.
+
+    `metadata_bytes` is the serialised `celaut.Metadata` the packer already
+    produced in `ZipContainerPacker.save()`; its `hashtag` carries the service-id
+    hashes, so the imported metadata block is complete and self-validating."""
     # Imported lazily so the module is importable without the nodo deps present
     # (e.g. for unit-testing the HTTP layer on a dev box).
     sys.path.insert(0, NODO_DIR)
-    from bee_rpc import client as grpcbb  # type: ignore
-    buf = bytearray()
-    for b in grpcbb.read_from_registry(filename=service_dir):
-        data = b.SerializeToString()
-        buf.extend(len(data).to_bytes(4, "big"))
-        buf.extend(data)
-    return bytes(buf)
+    from bee_rpc.client import write_to_file, Dir  # type: ignore
+    from protos import celaut_pb2  # type: ignore
+
+    work = tempfile.mkdtemp(prefix="bee-", dir=os.environ["CACHE"])
+    try:
+        # write_to_file references each block by path; materialise the metadata
+        # bytes as a file so it can be a Dir block alongside the service dir.
+        meta_path = os.path.join(work, "metadata")
+        with open(meta_path, "wb") as f:
+            f.write(metadata_bytes or celaut_pb2.Metadata().SerializeToString())
+
+        def _blocks():
+            yield Dir(dir=meta_path, _type=celaut_pb2.Metadata)
+            yield Dir(dir=service_dir, _type=celaut_pb2.Service)
+
+        out_file = write_to_file(
+            path=work,
+            file_name="service",
+            extension="celaut.bee",
+            input=_blocks(),
+            indices={
+                1: celaut_pb2.Metadata,
+                2: celaut_pb2.Service,
+            },
+        )
+        with open(out_file, "rb") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -554,8 +581,8 @@ class Handler(BaseHTTPRequestHandler):
                         ap = os.path.join(root, name)
                         zf.write(ap, os.path.relpath(ap, project))
 
-            service_id, _meta, service_dir = _run_packer(norm_zip)
-            bee = _serialize_bee(service_dir)
+            service_id, metadata_bytes, service_dir = _run_packer(norm_zip)
+            bee = _serialize_bee(service_dir, metadata_bytes)
 
             fname = f"{service_id}.celaut.bee"
             return self._send(
