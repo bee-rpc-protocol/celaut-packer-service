@@ -1,25 +1,13 @@
-import logging, os
+import logging
 from decimal import Decimal, getcontext, InvalidOperation
 
-from src.utils.config import ConfigManager
-
-env_manager = ConfigManager()
-STORAGE, USE_PRINT = env_manager.get("STORAGE"), env_manager.get("USE_PRINT")
-
-if not os.path.exists(STORAGE):
-    os.makedirs(STORAGE)
-
 logging.basicConfig(
-    filename=f'{STORAGE}/app.log',
+    filename=f'app.log',
     level=logging.INFO,
     format='%(message)s'
 )
 
-LOGGER = (
-    lambda message: print(message + '\n')
-) if USE_PRINT else (
-    lambda message: logging.getLogger(__name__).info(message + '\n')
-)
+LOGGER = lambda message: logging.getLogger(__name__).info(message + '\n')
 
 def ssformat(number, sig_digits=3):
     """

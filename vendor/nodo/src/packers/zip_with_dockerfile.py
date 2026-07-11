@@ -10,7 +10,6 @@ from bee_rpc import client as grpcbb
 from bee_rpc.utils import modify_env
 from bee_rpc import buffer_pb2, block_builder
 from protos import celaut_pb2 as celaut, pack_pb2, gateway_bee
-from src.utils.config import ConfigManager
 from src.utils.hashing import SHA3_256_ID, get_configured_hash_spec, hash_stream
 from src.utils.arch_guard import ensure_native_arch
 from src.utils.runtime import DOCKER_COMMAND, DOCKER_ENV, PACKER_SUPPORTED_ARCHITECTURES
@@ -21,25 +20,20 @@ from src.utils.filesystem_xattrs import (
     metadata_from_lstat,
 )
 from src.utils.verify import calculate_hashes, calculate_hashes_by_stream
-from src.utils.config import ConfigManager
 from src.manager.resources import IOBigData
 
-env_manager = ConfigManager()
 
-CACHE = env_manager.get("CACHE")
-BLOCKDIR = env_manager.get("BLOCKDIR")
-PACKER_MEMORY_SIZE_FACTOR = env_manager.get("PACKER_MEMORY_SIZE_FACTOR")
-SAVE_ALL = env_manager.get("SAVE_ALL")
-MIN_BUFFER_BLOCK_SIZE = env_manager.get("MIN_BUFFER_BLOCK_SIZE")
-BUILDX_NETWORK = env_manager.get("packer.docker.BUILDX_NETWORK", "host")
-BUILDX_BUILDER = env_manager.get("packer.docker.BUILDX_BUILDER", "nodo-hostnet")
+CACHE = "__cache__"
+BLOCKDIR = "__blocks__"
+PACKER_MEMORY_SIZE_FACTOR = 2.0
+MIN_BUFFER_BLOCK_SIZE = 10 * 1024 * 1024  # 10MB
+BUILDX_NETWORK = "host"
+BUILDX_BUILDER = "nodo-hostnet"
 
 # Ensure bee_rpc uses the configured cache and block directories.
-if CACHE:
-    os.makedirs(CACHE, exist_ok=True)
-if BLOCKDIR:
-    os.makedirs(BLOCKDIR, exist_ok=True)
-    modify_env(cache_dir=CACHE, block_dir=BLOCKDIR)
+os.makedirs(CACHE, exist_ok=True)
+os.makedirs(BLOCKDIR, exist_ok=True)
+modify_env(cache_dir=CACHE, block_dir=BLOCKDIR)
 
 
 class ZipContainerPacker:
@@ -421,7 +415,7 @@ class ZipContainerPacker:
             pf_object_with_block_pointers=self.service,
             blocks=self.blocks
         )
-        hash_spec = get_configured_hash_spec(env_manager)
+        hash_spec = get_configured_hash_spec()
         configured_digest = hash_stream(
             grpcbb.read_multiblock_directory(directory=service_directory),
             hash_spec
@@ -524,13 +518,13 @@ def zipfile_ok(zip: str) -> Tuple[str, celaut.Metadata, str]:
     )  # Specification file
 
 
-def pack_zip(zip: str, saveit: bool = SAVE_ALL) -> Generator[buffer_pb2.Buffer, None, None]:
+def pack_zip(zip: str) -> Generator[buffer_pb2.Buffer, None, None]:
     log.LOGGER('Compiling zip ' + str(zip))
     IOBigData().log_snapshot(context=f"pack-daemon:before-worker zip={zip}")
     lock_file = _acquire_pack_lock()
     try:
         result_path = os.path.join(CACHE, f"pack_result_{uuid.uuid4().hex}.json")
-        main_dir = env_manager.get("MAIN_DIR") or os.getcwd()
+        main_dir = os.getcwd()
         cmd = [
             sys.executable, "-m", "src.packers.zip_with_dockerfile",
             "--worker", zip, result_path

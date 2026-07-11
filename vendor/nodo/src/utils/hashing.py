@@ -1,9 +1,7 @@
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Final, Iterable, Optional
-
-from src.utils.config import ConfigManager
+from typing import Callable, Dict, Final, Iterable
 
 SHA256_ID: Final[bytes] = bytes.fromhex(
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -130,14 +128,13 @@ def resolve_hash_config(value: str) -> HashSpec:
     return HASH_SPECS[hash_id]
 
 
-def get_configured_hash_spec(config_manager: Optional[ConfigManager] = None) -> HashSpec:
-    manager = config_manager or ConfigManager()
-    configured_value = manager.get("hashing.HASH", DEFAULT_HASH_NAME)
+def get_configured_hash_spec() -> HashSpec:
+    configured_value = DEFAULT_HASH_NAME
     return resolve_hash_config(str(configured_value))
 
 
-def get_configured_hash_id(config_manager: Optional[ConfigManager] = None) -> bytes:
-    return get_configured_hash_spec(config_manager).id_bytes
+def get_configured_hash_id() -> bytes:
+    return get_configured_hash_spec().id_bytes
 
 
 def hash_stream(chunks_iter: Iterable[bytes], spec: HashSpec) -> bytes:

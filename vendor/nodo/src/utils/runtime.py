@@ -5,38 +5,32 @@ from pathlib import Path
 import docker as docker_lib
 from protos import celaut_pb2
 
-from src.utils.config import ConfigManager
 from src.utils import logger as log
-
-config = ConfigManager()
 
 # Supported architectures derived from config.
 PACKER_SUPPORTED_ARCHITECTURES = []
-if config.get("packer.ARM_PACKER_SUPPORT"):
+if True:
     PACKER_SUPPORTED_ARCHITECTURES.append(["linux/arm64", "arm64", "arm_64", "aarch64"])
-if config.get("packer.X86_PACKER_SUPPORT"):
+if True:
     PACKER_SUPPORTED_ARCHITECTURES.append(["linux/amd64", "x86_64", "amd64"])
 
 SUPPORTED_ARCHITECTURES = []
-if config.get("builder.ARM_SUPPORT"):
+if True:
     SUPPORTED_ARCHITECTURES.append(["linux/arm64", "arm64", "arm_64", "aarch64"])
-if config.get("builder.X86_SUPPORT"):
+if True:
     SUPPORTED_ARCHITECTURES.append(["linux/amd64", "x86_64", "amd64"])
 
 # Docker runtime values.
-_main_dir = config.get("main.MAIN_DIR")
+_main_dir = os.getcwd()
 NODO_ROOT = Path(_main_dir).expanduser().resolve() if _main_dir else Path(__file__).resolve().parents[2]
 DEFAULT_BIN_DIR = NODO_ROOT / "bin"
 
-DOCKER_BIN = str(config.get("dependencies.docker.BIN") or (DEFAULT_BIN_DIR / "docker"))
-DOCKERD_BIN = str(config.get("dependencies.docker.DAEMON_BIN") or (DEFAULT_BIN_DIR / "dockerd"))
-BUILDX_BIN = str(
-    config.get("dependencies.docker.BUILDX_BIN")
-    or (NODO_ROOT / "libexec" / "docker" / "cli-plugins" / "docker-buildx")
-)
+DOCKER_BIN = str((DEFAULT_BIN_DIR / "docker"))
+DOCKERD_BIN = str((DEFAULT_BIN_DIR / "dockerd"))
+BUILDX_BIN = str(NODO_ROOT / "libexec" / "docker" / "cli-plugins" / "docker-buildx")
 BIN_DIR = Path(DOCKER_BIN).resolve().parent
 PLUGIN_DIR = Path(BUILDX_BIN).resolve().parent
-DOCKER_SOCKET = config.get("virtualizers.docker.DOCKER_SOCKET") or str(NODO_ROOT / "docker" / "docker.sock")
+DOCKER_SOCKET = str(NODO_ROOT / "docker" / "docker.sock")
 
 if not os.path.isfile(DOCKER_BIN):
     raise RuntimeError(f"Cliente Docker de Nodo no encontrado en {DOCKER_BIN}. Ejecuta el instalador.")
@@ -69,7 +63,7 @@ def _ensure_docker_daemon_running():
     if os.path.exists(socket_path):
         return True
 
-    main_dir = config.get("main.MAIN_DIR")
+    main_dir = os.getcwd()
     start_script = os.path.join(main_dir, "bash", "start_docker_daemon.sh")
 
     if os.path.exists(start_script):
@@ -101,8 +95,8 @@ def _create_docker_client():
     try:
         client = docker_lib.DockerClient(
             base_url=base_url,
-            timeout=config.get("virtualizers.docker.DOCKER_CLIENT_TIMEOUT", 480),
-            max_pool_size=config.get("virtualizers.docker.DOCKER_MAX_CONNECTIONS", 1000)
+            timeout=480,
+            max_pool_size=1000
         )
         return client
     except Exception as e:
