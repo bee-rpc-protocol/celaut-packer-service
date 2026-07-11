@@ -8,10 +8,10 @@ containing a Dockerfile, a packer config and a service.json, it builds the
 image, exports its filesystem, serialises a content-addressed `celaut.Service`
 protobuf, and returns the packed service as a single `.celaut.bee` file.
 
-It does NOT re-implement the packer. It vendors the real nodo packer in-repo
-(vendor/nodo/, COPYed to /opt/nodo at image-build time — no clone of nodo) and
-invokes its worker entrypoint, so the service-id produced here is byte-identical
-to `nodo pack`. Docker/buildx runs
+It does NOT re-implement the packer. It ships the real packer source in-repo
+(src/, COPYed to /opt/nodo at image-build time — no clone of nodo) and invokes
+its worker entrypoint, so the service-id produced here is byte-identical to
+`nodo pack`. Docker/buildx runs
 inside this microVM (docker-in-docker); that is why the service declares
 `network: tag=(*)` — buildx must reach arbitrary registries to pull base images.
 
@@ -93,45 +93,30 @@ os.environ.setdefault("BLOCKDIR", "/var/lib/celaut/blocks/")
 # safe — no separators / traversal — since it names a directory under REGISTRY.
 _SERVICE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,255}$")
 
-# Cache of the packer's registry dirs so we only parse config.yaml once.
+# Cache of the packer's registry dirs so we only resolve them once.
 _REGISTRY_DIRS = None
 
 
-def _load_packer_config() -> dict:
-    """Read the same config.yaml the vendored packer/ggconf reads (NODO_DIR/
-    config.yaml, i.e. the COPYed packer-config.yaml). Returns {} if it can't be
-    read (e.g. on a dev box without the image layout / without PyYAML), so the
-    caller can fall back to defaults."""
-    path = os.path.join(NODO_DIR, "config.yaml")
-    try:
-        import yaml  # PyYAML is present in the image (ConfigManager needs it).
-        with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
-        return {}
-
-
 def _registry_dirs():
-    """Resolve (REGISTRY, METADATA_REGISTRY, BLOCKDIR) — the dirs the vendored
-    ggconf resolves a registry dependency against. These MUST match what the
-    packer worker uses (config.yaml -> main.*), otherwise an injected dependency
-    lands where the packer can't see it.
+    """Resolve (REGISTRY, METADATA_REGISTRY, BLOCKDIR) — the dirs a registry
+    dependency is resolved against. These MUST match what the packer worker
+    uses, otherwise an injected dependency lands where the packer can't see it.
 
-    Order: explicit PACKER_*_DIR env overrides (used by tests to point at temp
-    dirs) -> config.yaml main.* -> the image's built-in defaults.
+    There is no config.yaml (this is a single-purpose service, not a node): the
+    dirs come from explicit PACKER_*_DIR env overrides (used by tests to point at
+    temp dirs), then BLOCKDIR from start.sh env, then the image's built-in
+    defaults under /opt/nodo/storage.
     """
     global _REGISTRY_DIRS
     if _REGISTRY_DIRS is not None:
         return _REGISTRY_DIRS
-    cfg = _load_packer_config()
-    main = cfg.get("main", {}) if isinstance(cfg, dict) else {}
     registry = (os.environ.get("PACKER_REGISTRY_DIR")
-                or main.get("REGISTRY") or "/opt/nodo/storage/__registry__/")
+                or "/opt/nodo/storage/__registry__/")
     metadata = (os.environ.get("PACKER_METADATA_DIR")
-                or main.get("METADATA_REGISTRY")
                 or "/opt/nodo/storage/__metadata__/")
     blocks = (os.environ.get("PACKER_BLOCKS_DIR")
-              or main.get("BLOCKDIR") or "/opt/nodo/storage/__block__/")
+              or os.environ.get("BLOCKDIR")
+              or "/opt/nodo/storage/__block__/")
     _REGISTRY_DIRS = (registry, metadata, blocks)
     return _REGISTRY_DIRS
 

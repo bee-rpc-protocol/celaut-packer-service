@@ -25,9 +25,12 @@ export DOCKER_HOST="unix://${NODO_DIR}/docker/docker.sock"
 
 export CACHE="${CACHE:-/var/lib/celaut/cache/}"
 export BLOCKDIR="${BLOCKDIR:-/var/lib/celaut/blocks/}"
-# Packer tunables consumed by ConfigManager (safe defaults mirroring nodo).
+# Packer tunables. NOTE: the block-size that drives the service-id is hardcoded
+# in the worker (src/packers/zip_with_dockerfile.py: MIN_BUFFER_BLOCK_SIZE =
+# 10*1024*1024). This env is kept only for any non-packer reader and is aligned
+# to that same 10 MiB so nothing disagrees.
 export PACKER_MEMORY_SIZE_FACTOR="${PACKER_MEMORY_SIZE_FACTOR:-2}"
-export MIN_BUFFER_BLOCK_SIZE="${MIN_BUFFER_BLOCK_SIZE:-1048576}"
+export MIN_BUFFER_BLOCK_SIZE="${MIN_BUFFER_BLOCK_SIZE:-10485760}"
 export SAVE_ALL="${SAVE_ALL:-False}"
 # Build with the host-network builder so buildx egress uses the VM's (*) channel.
 export BUILDX_BUILDER="${BUILDX_BUILDER:-nodo-hostnet}"

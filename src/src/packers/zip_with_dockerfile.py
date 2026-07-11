@@ -61,7 +61,9 @@ class ZipContainerPacker:
         # 2. Prepare output path
         dest_path = os.path.join(CACHE, self.aux_id, "filesystem")
         os.makedirs(dest_path, exist_ok=True)
-        tar_path = os.path.join(CACHE, self.aux_id, "filesystem.tar")
+        # Absolute: buildx runs with cwd=self.path (the build-context dir), so a
+        # CACHE-relative dest would resolve *under* the context and fail to open.
+        tar_path = os.path.abspath(os.path.join(CACHE, self.aux_id, "filesystem.tar"))
 
         # 3. Construct secure command
         # Ensure a buildx builder with host network is available when requested.
@@ -114,7 +116,7 @@ class ZipContainerPacker:
             "--builder", str(BUILDX_BUILDER),
             "--network", str(BUILDX_NETWORK),
             "--output", f"type=tar,dest={tar_path}",
-            self.path
+            os.path.abspath(self.path)
         ]
 
         # 4. Secure execution

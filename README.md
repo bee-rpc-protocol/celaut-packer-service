@@ -6,10 +6,10 @@ over HTTP. Give it a project archive (a zip with a `Dockerfile`, a
 filesystem, serialises a content-addressed `celaut.Service`, and returns the
 packed service as a single **`.celaut.bee`** file.
 
-It is a thin wrapper around the *real* nodo packer
-(`src/packers/zip_with_dockerfile.py`), **vendored in-repo** under
-[`vendor/nodo/`](vendor/nodo/) — not a re-implementation — so the `service_id`
-it emits is byte-identical to `nodo pack`. The vendored tree is the exact
+It is a thin wrapper around the *real* packer worker
+(`src/packers/zip_with_dockerfile.py`), **shipped in-repo** under
+[`src/`](src/) — not a re-implementation — so the `service_id`
+it emits is byte-identical to `nodo pack`. That tree is the exact
 transitive import closure of the packer worker (packer + `src.utils` /
 `src.manager.resources` + the `protos/` package); the image no longer clones
 nodo at build time, so this service is self-contained and unaffected when nodo
@@ -164,7 +164,7 @@ Docker-in-Docker container:
   emulation does not introduce non-determinism.
 
 Determinism depends on two upstream-nodo fixes that are **baked into the
-vendored source** under `vendor/nodo/` (search for `DETERMINISM PATCH`);
+packer source** under `src/` (search for `DETERMINISM PATCH`);
 without them packing is non-reproducible. The Dockerfile asserts both are
 present so a regression fails the build:
 

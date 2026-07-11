@@ -43,33 +43,41 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iptables iproute2 kmod e2fsprogs xfsprogs pigz xz-utils openssl uidmap \
     && rm -rf /var/lib/apt/lists/*
 
-# Vendor the nodo packer IN-REPO (self-contained — no clone of nodo at build
-# time). vendor/nodo/ carries the exact transitive import closure of the packer
+# The packer source lives IN-REPO under src/ (self-contained — no clone of nodo
+# at build time). It carries the exact transitive import closure of the packer
 # worker `src.packers.zip_with_dockerfile`: the packer itself plus its
 # src.utils / src.manager.resources deps and the whole protos/ package. This
-# tree is independent of upstream nodo, so nodo can drop its Docker packer
-# without breaking this service. See vendor/nodo/README.md.
-COPY ./vendor/nodo/ /opt/nodo/
+# tree is maintained here now (originally derived from nodo, but independent of
+# it). The outer src/ mirrors the /opt/nodo payload; the inner src/ is the
+# Python package root. See src/README.md.
+COPY ./src/ /opt/nodo/
 
 # nodo resolves its docker tooling under NODO_ROOT (=/opt/nodo): bin/docker,
 # bin/dockerd, libexec/docker/cli-plugins/docker-buildx, and the socket at
 # docker/docker.sock — and RAISES if they're missing. Place the static engine
-# binaries exactly there (after the vendor COPY, so the dir merges cleanly).
+# binaries exactly there (after the src COPY, so the dir merges cleanly).
 COPY --from=dind /usr/local/bin/ /opt/nodo/bin/
 COPY --from=dind /usr/local/libexec/ /opt/nodo/libexec/
 
-# Determinism patches are now BAKED into the vendored source (search for
-# "DETERMINISM PATCH" in vendor/nodo/). They make this service's ids match
+# Determinism patches are now BAKED into the packer source (search for
+# "DETERMINISM PATCH" in src/). They make this service's ids match
 # `nodo pack` on a patched node, and make repeated packs reproducible:
 #   1. recursive_parsing sorts os.listdir() so filesystem branch order (hence
 #      serialized bytes) is stable across extractions of the same tar.
 #   2. mtime_ns is normalised to 0 (tar reassigns symlink mtimes to wall-clock
 #      time, which would otherwise change the id every pack).
-# Assert they are present so a regression in the vendored tree fails the build.
+# A third fix (correctness, not determinism) is baked in the same way: the packer
+# runs `docker buildx build` with cwd=self.path (the build-context dir) but the
+# --output dest and the context arg were CACHE-relative, so under that cwd they
+# double-nested — buildx couldn't find the context / write filesystem.tar, and
+# every pack failed with HTTP 400. Both are absolutized now (os.path.abspath).
+# Assert all three are present so a regression in the source fails the build.
 RUN grep -q 'sorted(os.listdir(host_dir + directory))' \
         "${NODO_DIR}/src/packers/zip_with_dockerfile.py" \
     && grep -q 'mtime_ns=0,' "${NODO_DIR}/src/utils/filesystem_xattrs.py" \
-    && echo "determinism patches present in vendored source"
+    && grep -q 'os.path.abspath(self.path)' \
+        "${NODO_DIR}/src/packers/zip_with_dockerfile.py" \
+    && echo "packer source fixes present"
 
 # Install exactly the deps the packer worker (src/packers/zip_with_dockerfile)
 # imports — NOT nodo's full requirements (those drag in the Ergo payment stack:
@@ -90,12 +98,13 @@ RUN pip3 install --no-cache-dir \
         "git+https://github.com/bee-rpc-protocol/bee-rpc-over-grpc-py@7a2a344bc29546328bcf2f753dc2407f2c226376" \
     && python3 -c "from bee_rpc import client; import google.protobuf; from google.protobuf.internal import api_implementation as a; assert a.Type()=='python', 'expected pure-python protobuf, got '+a.Type(); print('deps ok, protobuf', google.protobuf.__version__, a.Type())"
 
-# Packer config. The vendored ConfigManager loads "config.yaml" relative to the
-# worker's cwd (=NODO_DIR), and RAISES if absent; it also drives the SERVICE-ID
-# (hash spec = sha3_256, MIN_BUFFER_BLOCK_SIZE = 10MB, packer arch support). This
-# is the node's own config, sanitized (no ledgers/secrets/token) and re-pathed to
-# /opt/nodo, so the service packs byte-identically to `nodo pack`.
-COPY ./packer-config.yaml /opt/nodo/config.yaml
+# No config.yaml. A config file makes sense on a full nodo, but not for a
+# single-purpose service — the determinism-critical values are hardcoded in the
+# source instead: hash spec = sha3_256 (src/utils/hashing.py DEFAULT_HASH_NAME),
+# MIN_BUFFER_BLOCK_SIZE = 10 MiB (src/packers/zip_with_dockerfile.py), and packer
+# arch support (src/utils/runtime.py PACKER_SUPPORTED_ARCHITECTURES). Runtime dirs
+# come from start.sh env (CACHE / BLOCKDIR). So the service still packs
+# byte-identically to `nodo pack`, with nothing to keep in sync.
 
 # --- Browser IDE (code-server) ------------------------------------------------
 # A full VS Code in the browser, served on :8443 alongside the packer API. Users

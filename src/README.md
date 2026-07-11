@@ -1,10 +1,14 @@
-# vendor/nodo — in-repo snapshot of the nodo packer
+# src/ — the packer source (maintained here)
 
-This directory carries the **packing/build code from
-[`celaut-project/nodo`](https://github.com/celaut-project/nodo)** so the packer
-service is **self-contained**: the image no longer `git clone`s nodo at build
-time, and this service keeps working even after nodo removes its own local
-Docker packer.
+This directory carries the **packing/build code** for the service, so it is
+**self-contained**: the image no longer `git clone`s nodo at build time, and the
+service keeps working even after nodo removes its own local Docker packer. The
+code originally derived from [`celaut-project/nodo`](https://github.com/celaut-project/nodo)
+but is now maintained here (fixes below should be upstreamed to nodo too).
+
+> Layout note: the outer `src/` mirrors the `/opt/nodo` payload (`COPY ./src/
+> /opt/nodo/`); the inner `src/` is the Python package root, so the worker is
+> importable as `src.packers.zip_with_dockerfile` with cwd `/opt/nodo`.
 
 ## What's here
 
@@ -30,18 +34,22 @@ present — it resolves every internal module and stops only at runtime.py's
 expected "docker binary not found" check (satisfied in the image by the static
 engine binaries layered under `/opt/nodo/bin`).
 
-## Determinism patches (baked in)
+## Fixes baked into the source
 
-Two upstream-nodo non-determinisms are fixed **directly in the vendored
-source** (grep `DETERMINISM PATCH`). The Dockerfile asserts both are present so
-a regression fails the build:
+Three fixes are applied **directly in this source** (grep `DETERMINISM PATCH`).
+The Dockerfile asserts all three are present so a regression fails the build:
 
 1. `src/packers/zip_with_dockerfile.py` — `recursive_parsing` iterates
    `sorted(os.listdir(...))` so filesystem branch order (and the serialized
-   bytes / service-id) is stable across extractions of the same tar.
+   bytes / service-id) is stable across extractions of the same tar. *(determinism)*
 2. `src/utils/filesystem_xattrs.py` — `metadata_from_lstat` hashes
    `mtime_ns = 0` (tar reassigns symlink mtimes to wall-clock time, which would
-   otherwise change the id every pack).
+   otherwise change the id every pack). *(determinism)*
+3. `src/packers/zip_with_dockerfile.py` — the `docker buildx build` runs with
+   `cwd=self.path` (the build-context dir), but the `--output type=tar,dest=…`
+   and the context arg were `CACHE`-relative, so under that cwd they double-nested:
+   buildx couldn't find the context or write `filesystem.tar`, and every pack
+   failed with HTTP 400. Both are now `os.path.abspath(...)`. *(correctness)*
 
 ## Updating
 
