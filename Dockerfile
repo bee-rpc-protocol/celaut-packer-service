@@ -105,7 +105,7 @@ RUN pip3 install --no-cache-dir \
         "python-dotenv==1.0.0" psutil netifaces2 tabulate packaging \
         typing_extensions six mnemonic \
     && pip3 install --no-cache-dir --no-deps \
-        "git+https://github.com/agenticaihome/bee-rpc-over-grpc-py@cfc527a3913bd90b1e85906133b3cbbce52cb63a" \
+        "git+https://github.com/bee-rpc-protocol/bee-rpc-over-grpc-py@28b247484a1d981c7f702b2abed4573d7df0b797" \
     && python3 -c "from bee_rpc import client; import google.protobuf; from google.protobuf.internal import api_implementation as a; assert a.Type()=='python', 'expected pure-python protobuf, got '+a.Type(); print('deps ok, protobuf', google.protobuf.__version__, a.Type())"
 
 # No config.yaml. A config file makes sense on a full nodo, but not for a
