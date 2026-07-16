@@ -29,6 +29,94 @@ mem_manager = lambda len, timeout=None: IOBigData().lock(len=len, timeout=timeou
 
 PREVENT_KILL_WAIT_TIME = 5 # seconds
 
+# service.json reserves only 0.5 GB of RAM up front (at_init == at_most). When a
+# pack needs more than the currently-locked amount, the packer asks its own nodo
+# — the authority — to hotplug extra RAM into this microVM instead of failing
+# against the (older, static) system-available accounting.
+#
+# The grow call is delegated to the canonical node_controller library
+# (celaut-project/libraries), exactly like celaut-basics/demo-service does in its
+# /modify_max_memory endpoint: build a Controller from the config file the node
+# mounts at /__config__ (it carries the initial resources + gateway URL) and call
+# Controller.modify_resources({'max': needed, 'min': 0}). We no longer hand-roll
+# the Gateway ModifyServiceSystemResources RPC.
+NODE_CONFIG_FILE = os.environ.get("PACKER_CONFIG_FILE", "/__config__")
+# App dir handed to the Controller (where it keeps its __services__/__metadata__
+# scratch dirs). Mirrors demo-service's DIR="service".
+NODE_APP_DIR = os.environ.get("PACKER_APP_DIR", "service")
+# Extra RAM requested above the strict need, so a grow doesn't land exactly on
+# the edge and immediately need another round-trip.
+GROW_HEADROOM_BYTES = int(os.environ.get("PACKER_GROW_HEADROOM_BYTES", 128 * 1024 * 1024))
+
+
+class NodeControllerResourceManager:
+    """Grow this microVM's RAM through celaut's ``node_controller`` library.
+
+    Mirrors celaut-basics/demo-service: it lazily builds a
+    ``node_controller.controller.Controller`` from the config file the node mounts
+    at ``/__config__`` (initial resources + gateway URL) and calls
+    ``Controller.modify_resources({'max': needed, 'min': 0})`` to hotplug memory.
+    The node hotplugs the granted RAM, which then shows up in the system-available
+    accounting used by ``IOBigData.ram_pool``.
+
+    It is a no-op (returns ``None``) whenever there is no node to reach — no config
+    file, or ``node_controller``/its deps aren't importable (dev boxes, unit
+    tests) — so the original static locker behaviour is preserved verbatim.
+    """
+
+    def __init__(self, config_file: str = NODE_CONFIG_FILE, app_dir: str = NODE_APP_DIR,
+                 log=lambda message: print(message)) -> None:
+        self._config_file = config_file
+        self._app_dir = app_dir
+        self._log = log
+        self._controller = None
+        self._resolved = False
+
+    def _get_controller(self):
+        if self._resolved:
+            return self._controller
+        self._resolved = True
+        try:
+            if not self._config_file or not os.path.exists(self._config_file):
+                return None  # not running inside a node -> keep static behaviour
+            from node_controller.controller.controller import Controller
+            # Only the resource-modify path is needed, so skip the dependency- and
+            # resource-manager background machinery the demo service spins up.
+            self._controller = Controller(
+                debug=lambda m: self._log(f"[node_controller] {m}"),
+                app_dir=self._app_dir,
+                config_file=self._config_file,
+                default_dependency_manager=False,
+                default_resource_manager=False,
+            )
+        except Exception as e:
+            self._log(f"[MEM] node_controller unavailable for modify_resources: {e}")
+            self._controller = None
+        return self._controller
+
+    def modify_resources(self, min_bytes: int, max_bytes: Optional[int] = None) -> Optional[int]:
+        """Ask the node to hotplug memory up to ``max_bytes`` (mirrors demo
+        service: max=needed, min=0). Returns the granted ``mem_limit`` in bytes,
+        or ``None`` when no request could be made."""
+        controller = self._get_controller()
+        if controller is None:
+            return None
+        target = int(max_bytes if max_bytes is not None else min_bytes)
+        try:
+            from google.protobuf.json_format import MessageToDict
+            _resources, _gas_amount = controller.modify_resources(
+                resources={'max': target, 'min': 0}
+            )
+            granted = int(MessageToDict(_resources).get("memLimit", 0))
+            self._log(
+                f"[MEM] node granted mem_limit={IOBigData.convert_size(granted)} "
+                f"(requested max={IOBigData.convert_size(target)})"
+            )
+            return granted
+        except Exception as e:
+            self._log(f"[MEM] modify_resources call failed: {e}")
+            return None
+
 class IOBigData(metaclass=Singleton):
     class RamLocker(object):
         def __init__(self, len, iobd, timeout=None):
@@ -50,7 +138,8 @@ class IOBigData(metaclass=Singleton):
 
     def __init__(self,
                  log=lambda message: print(message),
-                 ram_pool_method=None
+                 ram_pool_method=None,
+                 resource_manager=None
                  ) -> None:
 
         self._initial_python_rss_bytes = _python_rss_bytes()  # Consumo del intérprete de python al iniciar el proceso, tomado como referencia de uso base para evitar el doble conteo con ram_locked. Se considera que esto es lo que gasta fuera del locked.
@@ -70,17 +159,50 @@ class IOBigData(metaclass=Singleton):
         self.ram_pool = ram_pool_method if ram_pool_method is not None else default_ram_pool
 
         self.log = log
-        self.ram_locked = 0  
+        self.ram_locked = 0
         self.get_ram_avaliable = lambda: self.ram_pool() - self.ram_locked
         self.amount_lock = RLock()
 
         self.waiting_bytes = 0
         self.wait_lock = Lock()
 
+        # Node-authority growth: when the static pool can't cover a lock, ask the
+        # node to hotplug more RAM via node_controller. Defaults to the real
+        # controller-backed manager, which no-ops when no node/config is reachable
+        # (dev boxes, tests).
+        self.resource_manager = resource_manager if resource_manager is not None else NodeControllerResourceManager(log=log)
+        self._last_growth_target = 0  # largest mem_limit already requested from the node
+
     # General methods.
 
     def set_log(self, log=lambda message: print(message)) -> None:
         self.log = log
+        if isinstance(getattr(self, "resource_manager", None), NodeControllerResourceManager):
+            self.resource_manager._log = log
+
+    def set_resource_manager(self, resource_manager) -> None:
+        self.resource_manager = resource_manager
+
+    def _request_growth(self, ram_amount: int) -> None:
+        """When the static pool can't satisfy ``ram_amount``, ask the node (the
+        authority) to hotplug more RAM into this microVM. No-op when no manager
+        or gateway is available, which leaves the original static wait/fail
+        behaviour untouched."""
+        rm = self.resource_manager
+        if rm is None:
+            return
+        with self.amount_lock:
+            # Total the daemon must hold at once: everything already locked, plus
+            # this request, plus a little headroom.
+            needed_total = self.ram_locked + ram_amount + GROW_HEADROOM_BYTES
+        if needed_total <= self._last_growth_target:
+            return  # already asked the node for at least this much this run
+        self._last_growth_target = needed_total
+        self.log(f"[MEM] static pool short for {IOBigData.convert_size(ram_amount)}; "
+                 f"requesting node grow to {IOBigData.convert_size(needed_total)}")
+        granted = rm.modify_resources(needed_total, needed_total)
+        if granted is not None:
+            self.log_snapshot(context=f"after-modify-resources granted={granted}")
 
     @staticmethod
     def convert_size(size_bytes):
@@ -176,6 +298,12 @@ class IOBigData(metaclass=Singleton):
         try:
             while True:
                 self.__stats('go to lock ' + IOBigData.convert_size(ram_amount))
+                # The declared 0.5 GB reservation is only a floor. If the static
+                # pool can't cover this lock, ask the node to hotplug more RAM
+                # before we block/fail against the older static accounting.
+                if not self.__can_lock_ram(ram_amount=ram_amount, inclusive=True):
+                    self._request_growth(ram_amount)
+
                 if wait:
                     self.wait_to_prevent_kill(len=ram_amount, deadline=deadline)
 
