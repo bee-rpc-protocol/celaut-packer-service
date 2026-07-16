@@ -9,9 +9,10 @@ Two things are verified, both without Docker/KVM so they run anywhere:
   2. The RAM locker grows on demand through the node. `service.json` is only a
      0.5 GB floor now, so when a pack needs more than the currently-locked
      amount, `IOBigData.lock_ram` asks its nodo — the authority — to hotplug
-     more memory (via `NodeResourceManager.modify_resources`, backed by the
-     Gateway `ModifyServiceSystemResources` RPC) instead of failing against the
-     older static system-available accounting.
+     more memory (via `NodeControllerResourceManager.modify_resources`, which
+     delegates to `node_controller.Controller.modify_resources` — the same call
+     celaut-basics/demo-service uses) instead of failing against the older static
+     system-available accounting.
 
 The runtime-growth tests import `src.manager.resources`, which needs `psutil`
 and the generated protos. On a bare box without them they SKIP rather than
@@ -70,7 +71,7 @@ class ServiceJsonReservationTests(unittest.TestCase):
 
 
 class _FakeManager:
-    """Stand-in for NodeResourceManager: records requests and (optionally)
+    """Stand-in for NodeControllerResourceManager: records requests and (optionally)
     'hotplugs' a shared pool holder so the static accounting sees more RAM."""
 
     def __init__(self, pool_holder=None, grant=True):
@@ -142,14 +143,47 @@ class LockGrowOnDemandTests(unittest.TestCase):
         self.assertEqual(iobd.ram_locked, 0)
 
 
+class _FakeController:
+    """Stand-in for node_controller.Controller: records the resources dict it was
+    called with and returns a (Sysresources, gas) tuple like the real one."""
+
+    def __init__(self, grant_bytes):
+        self.calls = []
+        self._grant = grant_bytes
+
+    def modify_resources(self, resources=None):
+        self.calls.append(resources)
+        # Real Controller returns (celaut_pb2.Sysresources, gas_amount).
+        return globals()["resources"].celaut_pb2.Sysresources(mem_limit=self._grant), 0
+
+
 @unittest.skipUnless(_HAVE_RESOURCES, f"resources deps unavailable: {_IMPORT_ERR}")
-class NodeResourceManagerResolveTests(unittest.TestCase):
+class NodeControllerResourceManagerTests(unittest.TestCase):
     def test_modify_resources_noops_without_config_file(self):
-        # No /__config__ -> no gateway -> returns None (static behaviour kept).
-        mgr = resources.NodeResourceManager(
+        # No /__config__ -> no controller can be built -> returns None (static
+        # behaviour kept). No node_controller import is even attempted.
+        mgr = resources.NodeControllerResourceManager(
             config_file="/nonexistent/__config__", log=lambda m: None
         )
         self.assertIsNone(mgr.modify_resources(HALF_GIB, HALF_GIB))
+
+    def test_delegates_to_node_controller_with_min_zero(self):
+        # With a controller available, the adapter must mirror demo-service:
+        # call Controller.modify_resources({'max': needed, 'min': 0}) and return
+        # the granted memLimit parsed from the returned Sysresources.
+        mgr = resources.NodeControllerResourceManager(log=lambda m: None)
+        fake = _FakeController(grant_bytes=700 * 1024 * 1024)
+        mgr._controller = fake
+        mgr._resolved = True  # skip real Controller construction / config read
+
+        need = 600 * 1024 * 1024
+        granted = mgr.modify_resources(need, need)
+
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0], {"max": need, "min": 0},
+                         "must send max=needed, min=0 exactly like demo-service")
+        self.assertEqual(granted, 700 * 1024 * 1024,
+                         "granted memLimit is parsed back from the Sysresources reply")
 
 
 if __name__ == "__main__":

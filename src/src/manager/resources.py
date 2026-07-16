@@ -32,85 +32,85 @@ PREVENT_KILL_WAIT_TIME = 5 # seconds
 # service.json reserves only 0.5 GB of RAM up front (at_init == at_most). When a
 # pack needs more than the currently-locked amount, the packer asks its own nodo
 # — the authority — to hotplug extra RAM into this microVM instead of failing
-# against the (older, static) system-available accounting. The node file below
-# is the serialized celaut.ConfigurationFile mounted by nodo inside the guest; it
-# carries the Gateway Instance we call back on.
+# against the (older, static) system-available accounting.
+#
+# The grow call is delegated to the canonical node_controller library
+# (celaut-project/libraries), exactly like celaut-basics/demo-service does in its
+# /modify_max_memory endpoint: build a Controller from the config file the node
+# mounts at /__config__ (it carries the initial resources + gateway URL) and call
+# Controller.modify_resources({'max': needed, 'min': 0}). We no longer hand-roll
+# the Gateway ModifyServiceSystemResources RPC.
 NODE_CONFIG_FILE = os.environ.get("PACKER_CONFIG_FILE", "/__config__")
+# App dir handed to the Controller (where it keeps its __services__/__metadata__
+# scratch dirs). Mirrors demo-service's DIR="service".
+NODE_APP_DIR = os.environ.get("PACKER_APP_DIR", "service")
 # Extra RAM requested above the strict need, so a grow doesn't land exactly on
 # the edge and immediately need another round-trip.
 GROW_HEADROOM_BYTES = int(os.environ.get("PACKER_GROW_HEADROOM_BYTES", 128 * 1024 * 1024))
 
 
-class NodeResourceManager:
-    """Client-side mirror of celaut-project/libraries ``ResourceManager``.
+class NodeControllerResourceManager:
+    """Grow this microVM's RAM through celaut's ``node_controller`` library.
 
-    The libraries package is not vendored/importable inside this fork, so this
-    reproduces the one call the packer needs: ``modify_resources(min, max) ->
-    granted`` backed by the Gateway ``ModifyServiceSystemResources`` RPC
-    (``ModifyServiceSystemResourcesInput{min_sysreq, max_sysreq}`` ->
-    ``ModifyServiceSystemResourcesOutput{sysreq, gas}``). The node identifies the
-    caller by its microVM IP and hotplugs the granted memory; the new capacity
-    then shows up in psutil's system-available accounting used by
-    ``IOBigData.ram_pool``.
+    Mirrors celaut-basics/demo-service: it lazily builds a
+    ``node_controller.controller.Controller`` from the config file the node mounts
+    at ``/__config__`` (initial resources + gateway URL) and calls
+    ``Controller.modify_resources({'max': needed, 'min': 0})`` to hotplug memory.
+    The node hotplugs the granted RAM, which then shows up in the system-available
+    accounting used by ``IOBigData.ram_pool``.
 
-    It is a no-op (returns ``None``) when there is no gateway to reach — e.g. on
-    a dev box, in unit tests, or when bee_rpc/protos are unavailable — so the
-    original static locker behaviour is preserved verbatim.
+    It is a no-op (returns ``None``) whenever there is no node to reach — no config
+    file, or ``node_controller``/its deps aren't importable (dev boxes, unit
+    tests) — so the original static locker behaviour is preserved verbatim.
     """
 
-    def __init__(self, config_file: str = NODE_CONFIG_FILE, log=lambda message: print(message)) -> None:
+    def __init__(self, config_file: str = NODE_CONFIG_FILE, app_dir: str = NODE_APP_DIR,
+                 log=lambda message: print(message)) -> None:
         self._config_file = config_file
+        self._app_dir = app_dir
         self._log = log
-        self._gateway_uri: Optional[str] = None
+        self._controller = None
         self._resolved = False
 
-    def _resolve_gateway(self) -> Optional[str]:
+    def _get_controller(self):
         if self._resolved:
-            return self._gateway_uri
+            return self._controller
         self._resolved = True
         try:
             if not self._config_file or not os.path.exists(self._config_file):
-                return None
-            cfg = celaut_pb2.ConfigurationFile()
-            with open(self._config_file, "rb") as f:
-                cfg.ParseFromString(f.read())
-            for slot in cfg.gateway.uri_slot:
-                for uri in slot.uri:
-                    if uri.ip and uri.port:
-                        self._gateway_uri = f"{uri.ip}:{uri.port}"
-                        return self._gateway_uri
+                return None  # not running inside a node -> keep static behaviour
+            from node_controller.controller.controller import Controller
+            # Only the resource-modify path is needed, so skip the dependency- and
+            # resource-manager background machinery the demo service spins up.
+            self._controller = Controller(
+                debug=lambda m: self._log(f"[node_controller] {m}"),
+                app_dir=self._app_dir,
+                config_file=self._config_file,
+                default_dependency_manager=False,
+                default_resource_manager=False,
+            )
         except Exception as e:
-            self._log(f"[MEM] could not resolve gateway for modify_resources: {e}")
-        return None
+            self._log(f"[MEM] node_controller unavailable for modify_resources: {e}")
+            self._controller = None
+        return self._controller
 
     def modify_resources(self, min_bytes: int, max_bytes: Optional[int] = None) -> Optional[int]:
-        """Ask the node to (re)size this microVM's memory. Returns the granted
-        ``mem_limit`` in bytes, or ``None`` when no request could be made."""
-        uri = self._resolve_gateway()
-        if not uri:
+        """Ask the node to hotplug memory up to ``max_bytes`` (mirrors demo
+        service: max=needed, min=0). Returns the granted ``mem_limit`` in bytes,
+        or ``None`` when no request could be made."""
+        controller = self._get_controller()
+        if controller is None:
             return None
-        if max_bytes is None:
-            max_bytes = min_bytes
+        target = int(max_bytes if max_bytes is not None else min_bytes)
         try:
-            import grpc
-            from bee_rpc import client as grpcbb
-            from protos import celaut_pb2_grpc
-            stub = celaut_pb2_grpc.GatewayStub(grpc.insecure_channel(uri))
-            output = next(grpcbb.client_grpc(
-                method=stub.ModifyServiceSystemResources,
-                input=celaut_pb2.ModifyServiceSystemResourcesInput(
-                    min_sysreq=celaut_pb2.Sysresources(mem_limit=int(min_bytes)),
-                    max_sysreq=celaut_pb2.Sysresources(mem_limit=int(max_bytes)),
-                ),
-                indices_parser=celaut_pb2.ModifyServiceSystemResourcesOutput,
-                partitions_message_mode_parser=True,
-            ), None)
-            if output is None:
-                return None
-            granted = int(output.sysreq.mem_limit)
+            from google.protobuf.json_format import MessageToDict
+            _resources, _gas_amount = controller.modify_resources(
+                resources={'max': target, 'min': 0}
+            )
+            granted = int(MessageToDict(_resources).get("memLimit", 0))
             self._log(
                 f"[MEM] node granted mem_limit={IOBigData.convert_size(granted)} "
-                f"(requested min={IOBigData.convert_size(min_bytes)})"
+                f"(requested max={IOBigData.convert_size(target)})"
             )
             return granted
         except Exception as e:
@@ -167,16 +167,17 @@ class IOBigData(metaclass=Singleton):
         self.wait_lock = Lock()
 
         # Node-authority growth: when the static pool can't cover a lock, ask the
-        # node to hotplug more RAM. Defaults to the real gateway-backed manager,
-        # which no-ops when no gateway/config is reachable (dev boxes, tests).
-        self.resource_manager = resource_manager if resource_manager is not None else NodeResourceManager(log=log)
+        # node to hotplug more RAM via node_controller. Defaults to the real
+        # controller-backed manager, which no-ops when no node/config is reachable
+        # (dev boxes, tests).
+        self.resource_manager = resource_manager if resource_manager is not None else NodeControllerResourceManager(log=log)
         self._last_growth_target = 0  # largest mem_limit already requested from the node
 
     # General methods.
 
     def set_log(self, log=lambda message: print(message)) -> None:
         self.log = log
-        if isinstance(getattr(self, "resource_manager", None), NodeResourceManager):
+        if isinstance(getattr(self, "resource_manager", None), NodeControllerResourceManager):
             self.resource_manager._log = log
 
     def set_resource_manager(self, resource_manager) -> None:

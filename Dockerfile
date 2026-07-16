@@ -89,6 +89,12 @@ RUN grep -q 'sorted(os.listdir(host_dir + directory))' \
 #     block format the id is hashed over. Installed --no-deps so we control
 #     protobuf/grpcio (bee_rpc hard-pins grpcio==1.56.0, which has no wheel here;
 #     grpcio is only the streaming transport and contributes no hashed bytes).
+#   * node_controller (celaut-project/libraries) — the canonical grow-on-demand
+#     client. src/manager/resources.py builds a Controller from /__config__ and
+#     calls Controller.modify_resources() to hotplug RAM (same as celaut-basics/
+#     demo-service) instead of hand-rolling the Gateway RPC. --no-deps: its only
+#     runtime dep is bee_rpc (already installed), so this won't disturb the
+#     pinned, pure-python protobuf/grpcio stack.
 RUN pip3 install --no-cache-dir \
         "protobuf==4.23.3" "grpcio" \
         "docker==6.1.3" requests requests-unixsocket "PyYAML==6.0.1" \
@@ -96,7 +102,9 @@ RUN pip3 install --no-cache-dir \
         typing_extensions six mnemonic \
     && pip3 install --no-cache-dir --no-deps \
         "git+https://github.com/bee-rpc-protocol/bee-rpc-over-grpc-py" \
-    && python3 -c "from bee_rpc import client; import google.protobuf; from google.protobuf.internal import api_implementation as a; assert a.Type()=='python', 'expected pure-python protobuf, got '+a.Type(); print('deps ok, protobuf', google.protobuf.__version__, a.Type())"
+    && pip3 install --no-cache-dir --no-deps \
+        "git+https://github.com/celaut-project/libraries" \
+    && python3 -c "from bee_rpc import client; import google.protobuf; from google.protobuf.internal import api_implementation as a; assert a.Type()=='python', 'expected pure-python protobuf, got '+a.Type(); from node_controller.controller.controller import Controller; print('deps ok, protobuf', google.protobuf.__version__, a.Type(), '+ node_controller import ok')"
 
 # No config.yaml. A config file makes sense on a full nodo, but not for a
 # single-purpose service — the determinism-critical values are hardcoded in the
