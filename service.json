@@ -19,11 +19,11 @@
   "resources": {
     "at_init": {
       "mem_limit": 536870912,
-      "disk_space": 2147483648
+      "disk_space": 10737418240
     },
     "at_most": {
       "mem_limit": 536870912,
-      "disk_space": 2147483648
+      "disk_space": 10737418240
     }
   },
   "network": [
