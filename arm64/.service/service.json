@@ -1,0 +1,35 @@
+{
+  "tag": ["celaut-packer-service", "packer", "ide", "v0.2.0"],
+  "architecture": "linux/arm64",
+  "init": {
+    "entry_path": ["app", "start.sh"]
+  },
+  "api": [
+    {
+      "port": 8080,
+      "transport": ["tcp"],
+      "protocol": ["http"]
+    },
+    {
+      "port": 8443,
+      "transport": ["tcp"],
+      "protocol": ["http"]
+    }
+  ],
+  "resources": {
+    "at_init": {
+      "mem_limit": 536870912,
+      "disk_space": 10737418240
+    },
+    "at_most": {
+      "mem_limit": 536870912,
+      "disk_space": 10737418240
+    }
+  },
+  "network": [
+    {
+      "tags": ["*"],
+      "prose": "Unrestricted outbound internet. The packer runs Docker/buildx inside the sealed microVM and must reach arbitrary container registries (Docker Hub, ghcr.io, etc.) to pull the base images referenced by the Dockerfile being packed. tag=(*) declares an unconstrained egress channel."
+    }
+  ]
+}

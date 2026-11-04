@@ -1,0 +1,11 @@
+# macOS metadata that can sync into the build context
+._*
+.DS_Store
+.AppleDouble
+# build artifacts
+*.celaut.bee
+*.bee
+*.zip
+__pycache__/
+*.pyc
+.git/

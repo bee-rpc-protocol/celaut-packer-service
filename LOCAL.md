@@ -21,7 +21,10 @@ the source (`src/utils/hashing.py` → `sha3_256`, `src/packers/zip_with_dockerf
 ## Build the image
 
 ```bash
-docker build -t packer-service .
+# a pack root holds symlinks, which Docker does not follow out of its context:
+# copy it with the links resolved (use arm64 on an arm64 host)
+cp -rL amd64 /tmp/packer-ctx
+docker build -t packer-service -f /tmp/packer-ctx/.service/Dockerfile /tmp/packer-ctx
 ```
 
 The build asserts the three baked-in source fixes are present (two determinism,
@@ -69,7 +72,8 @@ reproducibility is the whole point.
 ## To pack the self repo
 
 ```bash
-zip -r /tmp/packer.zip src ide start.sh pack_config.json service.json server.py Dockerfile
+cp -rL amd64 /tmp/packer-root   # or arm64
+(cd /tmp/packer-root && zip -r /tmp/packer.zip .)
 curl -sS -D - -o /tmp/packer.celaut.bee \
   --data-binary @/tmp/packer.zip \
   -H "Content-Type: application/zip" \

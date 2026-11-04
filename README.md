@@ -21,7 +21,7 @@ template, edit, and pack a service end-to-end without any local toolchain.
 
 ## API
 
-Bound on `0.0.0.0:8080` (declared in `service.json`).
+Bound on `0.0.0.0:8080` (declared in `<arch>/.service/service.json`).
 
 | Method | Path      | Body                | Response |
 |--------|-----------|---------------------|----------|
@@ -87,6 +87,24 @@ builder, then runs `server.py`. **This is why the service declares
 `network: tag=(*)`** — buildx must reach arbitrary container registries to pull
 the base images referenced by the Dockerfile being packed.
 
+### Packing the packer: one pack root per architecture
+
+The packer itself is released for both architectures, with the layout of
+`celaut-basics/demo-service` and `bitcoin-node`:
+
+```
+amd64/  arm64/           pack roots: nodo pack amd64 | nodo pack arm64
+├── .service/            Dockerfile, service.json, pack_config.json, .dockerignore (real files)
+└── src ide server.py start.sh  -> symlinks to the shared sources at the root
+```
+
+`nodo pack <dir>` reads only `<dir>/.service/`, copies `<dir>` following symlinks and takes
+the architecture from its `service.json`. The two `.service/` differ only in
+`"architecture"` (the Dockerfile pins multi-arch images). `tests/test_layout.py` checks the
+shape. Pack the root of the architecture of the node (`nodo pack` on an arm64 node cannot
+build `amd64`); an instance packs services of **its own architecture**: on an arm64 host,
+the packer answers 400 to a `linux/amd64` project ("cross-architecture builds are disabled").
+
 ### Multi-arch (amd64 + arm64 via qemu)
 
 The packer runs on an **amd64 host**, but it can pack services for **both
@@ -143,7 +161,7 @@ happens inside one sealed microVM.
 The acceptance test from the brief is a two-step bootstrap:
 
 1. **Pack the packer with the node.** On an amd64 + KVM node:
-   `nodo pack celaut-packer-service` → `celaut-packer-service` gets a
+   `nodo pack amd64` (or `nodo pack arm64` on an arm64 node) → the packer gets a
    real service-id; `nodo execute` it to get a running instance with an IP.
 2. **Pack another service with the packer.** Zip e.g. `examples/hello` (or
    `celaut-sat-solver`) and `POST /pack` it to the running packer instance. The

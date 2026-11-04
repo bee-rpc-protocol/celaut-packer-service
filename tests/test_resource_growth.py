@@ -48,7 +48,7 @@ class ServiceJsonReservationTests(unittest.TestCase):
     """No deps: assert the declared reservation was cut to 0.5 GB at both ranges."""
 
     def setUp(self):
-        with open(os.path.join(_REPO_ROOT, "service.json")) as f:
+        with open(os.path.join(_REPO_ROOT, "amd64", ".service", "service.json")) as f:
             self.res = json.load(f)["resources"]
 
     def test_ram_is_half_gig_at_both_ranges(self):
