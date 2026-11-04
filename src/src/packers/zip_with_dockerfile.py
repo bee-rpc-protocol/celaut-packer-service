@@ -4,7 +4,7 @@ from typing import Generator, List, Tuple
 
 from src.utils import logger as log
 import json
-import os, posixpath, stat, subprocess, platform, sys, uuid
+import dataclasses, os, posixpath, stat, subprocess, platform, sys, uuid
 import src.manager.resources as resources
 from bee_rpc import client as grpcbb
 from bee_rpc.utils import modify_env
@@ -104,6 +104,15 @@ def image_link_target(host_path: str, image_path: str) -> str:
         )
     return target
 
+
+
+# Mount points that `RUN` steps see mounted, so the Dockerfile's `touch` cannot reach them and
+# the builder decides their mtime. Both builders export the same tar for the same project
+# except for /sys: Docker (dockerd, here) mounts sysfs and exports the build time, nodo's
+# rootless BuildKit leaves it at epoch 0 (/proc, /dev and /etc/hosts are the same in both).
+# nodo's id counts those mtimes, so the service takes nodo's value for /sys to give the id
+# that `nodo pack` gives. Checked with both tars of examples/hello (src/README.md).
+BUILDER_MOUNT_POINTS_AT_EPOCH = ("/sys",)
 
 
 class ZipContainerPacker:
@@ -305,6 +314,8 @@ class ZipContainerPacker:
                     tar_metadata = self._tar_metadata_by_path.get((directory + b_name).lstrip("/"))
                     if tar_metadata is not None:
                         branch_metadata = tar_metadata
+                        if (directory + b_name) in BUILDER_MOUNT_POINTS_AT_EPOCH:
+                            branch_metadata = dataclasses.replace(branch_metadata, mtime_ns=0)
                     elif stat.S_ISDIR(branch_stat.st_mode):
                         branch_metadata = implicit_directory_metadata()
                     else:

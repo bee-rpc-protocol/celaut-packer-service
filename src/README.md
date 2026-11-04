@@ -65,10 +65,15 @@ packer is not: nodo builds with a rootless BuildKit, this service with `docker b
 - **xattrs are written sorted by key**, as nodo writes its sorted list; the pure-python
   protobuf serializes a map in insertion order, so the bytes are the same.
 
-Checked on `examples/hello` (`linux/arm64`) against `nodo pack` of the same directory: the
-trees are the same except for one `mtime_ns`, `/sys`, which Docker's tar names with the
-build time and nodo's BuildKit tar does not (`/proc` and `/dev` are the same in both). So
-the ids still differ for now.
+- **`/sys` is exported at epoch 0** (`BUILDER_MOUNT_POINTS_AT_EPOCH`). The `RUN` steps see
+  `/sys`, `/proc` and `/dev` mounted, so a Dockerfile's `touch` cannot reach them and the
+  builder sets their mtime. Docker's export and nodo's rootless BuildKit export of
+  `examples/hello` (522 entries each) are the same except `/sys`: Docker names the build time
+  and BuildKit leaves 0. `/proc`, `/dev` and `/etc/hosts` are the same in both. nodo's id
+  counts those mtimes, so `/sys` takes nodo's value.
+
+Checked on `examples/hello` (`linux/arm64`): the id that `POST /pack` gives is the one that
+`nodo pack` gives for the same directory.
 
 ## Updating
 
