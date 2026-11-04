@@ -51,6 +51,25 @@ The Dockerfile asserts all three are present so a regression fails the build:
    buildx couldn't find the context or write `filesystem.tar`, and every pack
    failed with HTTP 400. Both are now `os.path.abspath(...)`. *(correctness)*
 
+## Identity code ported from nodo
+
+The service id covers the filesystem metadata, so the packer has to read an image the way
+`nodo pack` does. These parts of nodo's `parseFilesys` are ported here (the rest of nodo's
+packer is not: nodo builds with a rootless BuildKit, this service with `docker buildx`):
+
+- **Symlink targets** are kept as the image has them (`os.readlink`), not resolved with
+  `os.path.realpath` (nodo #485: with `realpath` the id depended on the packing host).
+  An escaping link stops the pack.
+- **uid, gid, mode and mtime** come from the tar header (`metadata_from_tarinfo`), and a
+  directory with no member in the tar gets `implicit_directory_metadata()`.
+- **xattrs are written sorted by key**, as nodo writes its sorted list; the pure-python
+  protobuf serializes a map in insertion order, so the bytes are the same.
+
+Checked on `examples/hello` (`linux/arm64`) against `nodo pack` of the same directory: the
+trees are the same except for one `mtime_ns`, `/sys`, which Docker's tar names with the
+build time and nodo's BuildKit tar does not (`/proc` and `/dev` are the same in both). So
+the ids still differ for now.
+
 ## Updating
 
 To refresh against upstream nodo, re-copy the files listed above from the nodo

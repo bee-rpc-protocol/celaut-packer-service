@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import tarfile
 from dataclasses import dataclass
 from typing import Mapping, MutableMapping, Optional
 
@@ -91,19 +92,79 @@ def metadata_from_lstat(stat_result: os.stat_result) -> FilesystemNodeMetadata:
     )
 
 
+# tarfile.TarInfo.type -> the S_IF* type bits os.stat would report for the same entry
+# (ported from nodo, where this is what keeps the service id independent of who packs).
+_TAR_TYPE_TO_S_IFMT = {
+    tarfile.REGTYPE: stat.S_IFREG,
+    tarfile.AREGTYPE: stat.S_IFREG,
+    tarfile.LNKTYPE: stat.S_IFREG,
+    tarfile.DIRTYPE: stat.S_IFDIR,
+    tarfile.SYMTYPE: stat.S_IFLNK,
+    tarfile.CHRTYPE: stat.S_IFCHR,
+    tarfile.BLKTYPE: stat.S_IFBLK,
+    tarfile.FIFOTYPE: stat.S_IFIFO,
+}
+
+
+def metadata_from_tarinfo(tarinfo: tarfile.TarInfo) -> FilesystemNodeMetadata:
+    """Metadata from the tar header, as nodo takes it: the header does not depend on who
+    extracts the tar (uid/gid) nor on when (tarfile re-stamps a symlink's mtime)."""
+    ifmt = _TAR_TYPE_TO_S_IFMT.get(tarinfo.type)
+    if ifmt is None:
+        raise ValueError(
+            f"unsupported tar entry type {tarinfo.type!r} for '{tarinfo.name}'"
+        )
+    mode = ifmt | (tarinfo.mode & 0o7777)
+    if tarinfo.type in (tarfile.CHRTYPE, tarfile.BLKTYPE):
+        device_major = int(tarinfo.devmajor)
+        device_minor = int(tarinfo.devminor)
+        device_is_block = tarinfo.type == tarfile.BLKTYPE
+    else:
+        device_major = 0
+        device_minor = 0
+        device_is_block = False
+    return FilesystemNodeMetadata(
+        mode=mode,
+        uid=int(tarinfo.uid),
+        gid=int(tarinfo.gid),
+        mtime_ns=0 if ifmt == stat.S_IFLNK else int(tarinfo.mtime) * 1_000_000_000,
+        device_major=device_major,
+        device_minor=device_minor,
+        device_is_block=device_is_block,
+    )
+
+
+def implicit_directory_metadata() -> FilesystemNodeMetadata:
+    """A directory that tarfile created only as the parent of a deeper entry (no member of
+    its own in the tar): every packer fabricates the same values for it."""
+    return FilesystemNodeMetadata(
+        mode=stat.S_IFDIR | 0o755,
+        uid=0,
+        gid=0,
+        mtime_ns=0,
+        device_major=0,
+        device_minor=0,
+        device_is_block=False,
+    )
+
+
 def encode_filesystem_metadata_xattrs(
     xattrs: MutableMapping[str, bytes],
     metadata: FilesystemNodeMetadata,
 ) -> None:
-    xattrs[MODE_KEY] = str(metadata.mode).encode("utf-8")
-    xattrs[UID_KEY] = str(metadata.uid).encode("utf-8")
-    xattrs[GID_KEY] = str(metadata.gid).encode("utf-8")
-    xattrs[MTIME_NS_KEY] = str(metadata.mtime_ns).encode("utf-8")
-    xattrs[DEVICE_MAJOR_KEY] = str(metadata.device_major).encode("utf-8")
-    xattrs[DEVICE_MINOR_KEY] = str(metadata.device_minor).encode("utf-8")
-    xattrs[DEVICE_IS_BLOCK_KEY] = (
-        b"1" if metadata.device_is_block else b"0"
-    )
+    # Inserted sorted by key: nodo writes the entries as a sorted list, and the pure-python
+    # protobuf serializes a map in insertion order, so the bytes (and the id) are the same.
+    entries = {
+        MODE_KEY: str(metadata.mode).encode("utf-8"),
+        UID_KEY: str(metadata.uid).encode("utf-8"),
+        GID_KEY: str(metadata.gid).encode("utf-8"),
+        MTIME_NS_KEY: str(metadata.mtime_ns).encode("utf-8"),
+        DEVICE_MAJOR_KEY: str(metadata.device_major).encode("utf-8"),
+        DEVICE_MINOR_KEY: str(metadata.device_minor).encode("utf-8"),
+        DEVICE_IS_BLOCK_KEY: b"1" if metadata.device_is_block else b"0",
+    }
+    for key in sorted(entries):
+        xattrs[key] = entries[key]
 
 
 def parse_filesystem_metadata_xattrs(

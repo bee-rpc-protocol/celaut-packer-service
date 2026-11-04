@@ -4,7 +4,7 @@ from typing import Generator, List, Tuple
 
 from src.utils import logger as log
 import json
-import os, subprocess, platform, sys, uuid
+import os, posixpath, stat, subprocess, platform, sys, uuid
 import src.manager.resources as resources
 from bee_rpc import client as grpcbb
 from bee_rpc.utils import modify_env
@@ -17,7 +17,9 @@ from src.utils.filesystem_xattrs import (
     describe_mode_type,
     encode_filesystem_metadata_xattrs,
     is_supported_filesystem_entry_mode,
+    implicit_directory_metadata,
     metadata_from_lstat,
+    metadata_from_tarinfo,
 )
 from src.utils.verify import calculate_hashes, calculate_hashes_by_stream
 from src.manager.resources import IOBigData
@@ -49,6 +51,61 @@ os.makedirs(BLOCKDIR, exist_ok=True)
 modify_env(cache_dir=CACHE, block_dir=BLOCKDIR)
 
 
+# Ported from nodo (#485): the service id must not depend on the packing host.
+def _normalize_tar_member_path(name: str) -> str:
+    # Tar member names are posix paths, sometimes "./bin/bash", sometimes
+    # "bin/bash", sometimes "bin/" for a directory. Normalize to the same
+    # "bin/bash" shape recursive_parsing's own (directory + b_name) builds, so
+    # a lookup by path always hits. The root entry ("." or "./") normalizes to
+    # "" and is filtered out by the caller — it has no corresponding branch.
+    normalized = posixpath.normpath(name).lstrip("/")
+    return "" if normalized == "." else normalized
+
+
+class ImageLinkEscapeError(RuntimeError):
+    """A symlink of the image points outside the image root."""
+
+
+def _link_escapes_image(image_path: str, target: str) -> bool:
+    # Resolve the target by its text alone, against the image root: an absolute
+    # target starts at that root, a relative one at the link's own directory.
+    # It escapes if a ".." climbs above the root. Nothing on the packing host
+    # is read, so the answer is the same on every host.
+    if target.startswith("/"):
+        parts = []
+    else:
+        parts = [p for p in posixpath.dirname(image_path).split("/") if p]
+    for segment in target.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if not parts:
+                return True
+            parts.pop()
+        else:
+            parts.append(segment)
+    return False
+
+
+def image_link_target(host_path: str, image_path: str) -> str:
+    # The link text exactly as the image has it. The guest resolves it against
+    # its own root at run time. Do not resolve it here: realpath follows an
+    # absolute target through the packing host's root, so the guest got the
+    # host's /etc/alternatives choices (awk -> gawk) and the host's usrmerge
+    # (/lib64/ld-linux-x86-64.so.2 -> /usr/lib/...), and the service id
+    # changed with the packing host (#485).
+    #
+    # A link whose target leaves the image root stops the pack: the service
+    # must not depend on, or point at, anything outside its own filesystem.
+    target = os.readlink(host_path)
+    if _link_escapes_image(image_path, target):
+        raise ImageLinkEscapeError(
+            f"Symlink '{image_path}' -> '{target}' points outside the image root."
+        )
+    return target
+
+
+
 class ZipContainerPacker:
     def __init__(self, path, aux_id):
         self.blocks: List[bytes] = []
@@ -57,6 +114,7 @@ class ZipContainerPacker:
         self.path = path
         self.json = json.load(open(self.path + "service.json", "r"))
         self.aux_id = aux_id
+        self._tar_metadata_by_path = {}
         self.error_msg = None
         self._validate_service_json_shape()
 
@@ -165,7 +223,15 @@ class ZipContainerPacker:
             log.LOGGER(f"Extracting {tar_path} to {dest_path}...")
             import tarfile
             with tarfile.open(tar_path) as tar:
-                tar.extractall(path=dest_path)
+                members = tar.getmembers()
+                tar.extractall(path=dest_path, members=members)
+                # The tar's own record of each entry (uid/gid/mode/mtime), keyed by the
+                # path that parseFilesys looks it up with (ported from nodo).
+                self._tar_metadata_by_path = {
+                    _normalize_tar_member_path(member.name): metadata_from_tarinfo(member)
+                    for member in members
+                    if _normalize_tar_member_path(member.name)
+                }
             os.remove(tar_path)
 
             log.LOGGER("Filesystem export completed successfully.")
@@ -236,15 +302,21 @@ class ZipContainerPacker:
                             f"{describe_mode_type(branch_stat.st_mode)} "
                             f"(mode={oct(branch_stat.st_mode)})"
                         )
-                    branch_metadata = metadata_from_lstat(branch_stat)
+                    tar_metadata = self._tar_metadata_by_path.get((directory + b_name).lstrip("/"))
+                    if tar_metadata is not None:
+                        branch_metadata = tar_metadata
+                    elif stat.S_ISDIR(branch_stat.st_mode):
+                        branch_metadata = implicit_directory_metadata()
+                    else:
+                        branch_metadata = metadata_from_lstat(branch_stat)
                     encode_filesystem_metadata_xattrs(branch.xattrs, branch_metadata)
 
                     # It's a link.
                     if os.path.islink(branch_host_path):
                         branch.link.dst = directory + b_name
-                        branch.link.src = os.path.realpath(branch_host_path)[
-                                          len(host_dir):] if host_dir in os.path.realpath(
-                            branch_host_path) else os.path.realpath(branch_host_path)
+                        branch.link.src = image_link_target(
+                            branch_host_path, directory + b_name
+                        )
                     # Device node (block/char): represent as file placeholder and recover via xattrs in CH build.
                     elif branch_metadata.is_device:
                         branch.file = b""
