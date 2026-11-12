@@ -1,0 +1,25 @@
+{
+    "tag": ["celaut-packer-hello-rust", "example", "v0.3.0"],
+    "architecture": "linux/arm64",
+    "init": {
+        "entry_path": ["app", "hello"]
+    },
+    "api": [
+        {
+            "port": 8080,
+            "transport": "tcp",
+            "protocol": ["http"]
+        }
+    ],
+    "resources": {
+        "at_init": {
+            "mem_limit": 16777216,
+            "disk_space": 268435456
+        },
+        "at_most": {
+            "mem_limit": 67108864,
+            "disk_space": 536870912
+        }
+    },
+    "notice_declaration": false
+}

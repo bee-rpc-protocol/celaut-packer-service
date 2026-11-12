@@ -31,7 +31,7 @@ os.makedirs(os.environ["CACHE"], exist_ok=True)
 import server  # noqa: E402
 
 
-def _build_bundle(block_ids=("blockAAA",), with_metadata=True) -> bytes:
+def _build_bundle(block_ids=("aa01",), with_metadata=True) -> bytes:
     """Build an in-memory gzip-tar dependency bundle in the layout
     _store_registry_bundle expects."""
     manifest = [[b] for b in block_ids] + ["inline_chunk_0"]
@@ -71,7 +71,7 @@ class StoreLookupUnitTests(unittest.TestCase):
         self.assertIsNone(server._registry_status("deadbeef"))
 
     def test_store_then_status(self):
-        path = self._write_bundle(_build_bundle(block_ids=("blk1", "blk2")))
+        path = self._write_bundle(_build_bundle(block_ids=("b1a1", "b1a2")))
         res = server._store_registry_bundle("svc123", path)
         self.assertTrue(res["stored"])
         self.assertFalse(res["already_present"])
@@ -81,16 +81,16 @@ class StoreLookupUnitTests(unittest.TestCase):
         # ggconf reads exactly these paths:
         self.assertTrue(os.path.exists(os.path.join(registry, "svc123", "_.json")))
         self.assertTrue(os.path.exists(os.path.join(metadata, "svc123")))
-        self.assertTrue(os.path.exists(os.path.join(blockdir, "blk1")))
-        self.assertTrue(os.path.exists(os.path.join(blockdir, "blk2")))
+        self.assertTrue(os.path.exists(os.path.join(blockdir, "b1a1")))
+        self.assertTrue(os.path.exists(os.path.join(blockdir, "b1a2")))
 
         status = server._registry_status("svc123")
         self.assertTrue(status["present"])
         self.assertTrue(status["metadata"])
-        self.assertCountEqual(status["blocks"], ["blk1", "blk2"])
+        self.assertCountEqual(status["blocks"], ["b1a1", "b1a2"])
 
     def test_idempotent_second_store(self):
-        path = self._write_bundle(_build_bundle(block_ids=("blkX",)))
+        path = self._write_bundle(_build_bundle(block_ids=("b1fa",)))
         server._store_registry_bundle("svcABC", path)
         res2 = server._store_registry_bundle("svcABC", path)
         self.assertTrue(res2["already_present"])
@@ -166,7 +166,7 @@ class HttpEndpointTests(unittest.TestCase):
         self.assertFalse(json.loads(body)["present"])
 
         # Upload.
-        code, body = self._post(f"/registry/{sid}", _build_bundle(("hblk",)))
+        code, body = self._post(f"/registry/{sid}", _build_bundle(("abcd",)))
         self.assertEqual(code, 200)
         res = json.loads(body)
         self.assertTrue(res["stored"])
@@ -179,10 +179,10 @@ class HttpEndpointTests(unittest.TestCase):
         status = json.loads(body)
         self.assertTrue(status["present"])
         self.assertTrue(status["metadata"])
-        self.assertIn("hblk", status["blocks"])
+        self.assertIn("abcd", status["blocks"])
 
         # Idempotent re-upload.
-        code, body = self._post(f"/registry/{sid}", _build_bundle(("hblk",)))
+        code, body = self._post(f"/registry/{sid}", _build_bundle(("abcd",)))
         self.assertEqual(code, 200)
         self.assertTrue(json.loads(body)["already_present"])
 

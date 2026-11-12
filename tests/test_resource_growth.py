@@ -21,6 +21,9 @@ error, mirroring the lazy-import contract of the sibling test modules.
 Run:  python -m unittest tests.test_resource_growth   (from the repo root)
 """
 import json
+import subprocess
+import tempfile
+from unittest import mock
 import os
 import sys
 import unittest
@@ -147,47 +150,54 @@ class LockGrowOnDemandTests(unittest.TestCase):
         self.assertEqual(iobd.ram_locked, 0)
 
 
-class _FakeController:
-    """Stand-in for node_controller.Controller: records the resources dict it was
-    called with and returns a (Sysresources, gas) tuple like the real one."""
-
-    def __init__(self, grant_bytes):
-        self.calls = []
-        self._grant = grant_bytes
-
-    def modify_resources(self, resources=None):
-        self.calls.append(resources)
-        # Real Controller returns (celaut_pb2.Sysresources, gas_amount).
-        return globals()["resources"].celaut_pb2.Sysresources(mem_limit=self._grant), 0
-
-
 @unittest.skipUnless(_HAVE_RESOURCES, f"resources deps unavailable: {_IMPORT_ERR}")
 class NodeControllerResourceManagerTests(unittest.TestCase):
     def test_modify_resources_noops_without_config_file(self):
-        # No /__config__ -> no controller can be built -> returns None (static
-        # behaviour kept). No node_controller import is even attempted.
+        # No /__config__ -> no node to ask -> returns None (static behaviour
+        # kept). No child process is started.
         mgr = resources.NodeControllerResourceManager(
             config_file="/nonexistent/__config__", log=lambda m: None
         )
-        self.assertIsNone(mgr.modify_resources(HALF_GIB, HALF_GIB))
+        with mock.patch.object(resources.subprocess, "run") as run:
+            self.assertIsNone(mgr.modify_resources(HALF_GIB, HALF_GIB))
+        run.assert_not_called()
 
-    def test_delegates_to_node_controller_with_min_zero(self):
-        # With a controller available, the adapter must mirror demo-service:
-        # call Controller.modify_resources({'max': needed, 'min': 0}) and return
-        # the granted memLimit parsed from the returned Sysresources.
-        mgr = resources.NodeControllerResourceManager(log=lambda m: None)
-        fake = _FakeController(grant_bytes=700 * 1024 * 1024)
-        mgr._controller = fake
-        mgr._resolved = True  # skip real Controller construction / config read
+    def _manager(self):
+        config = tempfile.NamedTemporaryFile(suffix="-config", delete=False)
+        config.close()
+        self.addCleanup(os.unlink, config.name)
+        return resources.NodeControllerResourceManager(
+            config_file=config.name, app_dir="service", log=lambda m: None
+        ), config.name
 
+    def test_delegates_to_node_controller_in_a_child_process(self):
+        # node_controller registers its own celaut.proto, which cannot share a
+        # process with nodo's protos/. So the call runs in a child, like demo-service
+        # makes it: Controller.modify_resources({'max': needed, 'min': 0}).
+        mgr, config = self._manager()
         need = 600 * 1024 * 1024
-        granted = mgr.modify_resources(need, need)
+        done = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps({"mem_limit": 700 * 1024 * 1024}) + "\n", stderr=""
+        )
+        with mock.patch.dict(os.environ, {"PYTHONPATH": "/opt/nodo"}), \
+                mock.patch.object(resources.subprocess, "run", return_value=done) as run:
+            granted = mgr.modify_resources(need, need)
 
-        self.assertEqual(len(fake.calls), 1)
-        self.assertEqual(fake.calls[0], {"max": need, "min": 0},
-                         "must send max=needed, min=0 exactly like demo-service")
         self.assertEqual(granted, 700 * 1024 * 1024,
-                         "granted memLimit is parsed back from the Sysresources reply")
+                         "the granted mem_limit is read back from the child")
+        (cmd,), kwargs = run.call_args
+        self.assertEqual(cmd[:2], [sys.executable, "-c"])
+        self.assertEqual(cmd[3:], [config, "service", str(need)])
+        self.assertIn('{"max": target, "min": 0}', cmd[2],
+                      "must send max=needed, min=0 exactly like demo-service")
+        self.assertNotIn("PYTHONPATH", kwargs["env"], "the child must not import nodo's protos/")
+        self.assertEqual(kwargs["cwd"], "/")
+
+    def test_a_failed_child_answers_none(self):
+        mgr, _ = self._manager()
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom\n")
+        with mock.patch.object(resources.subprocess, "run", return_value=failed):
+            self.assertIsNone(mgr.modify_resources(HALF_GIB, HALF_GIB))
 
 
 if __name__ == "__main__":

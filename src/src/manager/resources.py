@@ -1,6 +1,9 @@
 # I/O Big Data utils.
 import gc
+import json
 import os
+import subprocess
+import sys
 import re
 import time
 from time import sleep
@@ -49,15 +52,42 @@ NODE_APP_DIR = os.environ.get("PACKER_APP_DIR", "service")
 GROW_HEADROOM_BYTES = int(os.environ.get("PACKER_GROW_HEADROOM_BYTES", 128 * 1024 * 1024))
 
 
+_GROW_SCRIPT = """
+import json, sys
+from google.protobuf.json_format import MessageToDict
+from node_controller.controller.controller import Controller
+config_file, app_dir, target = sys.argv[1], sys.argv[2], int(sys.argv[3])
+# Only the resource-modify path is needed, so skip the dependency- and
+# resource-manager background machinery the demo service spins up.
+controller = Controller(
+    debug=lambda m: print("[node_controller] " + str(m), file=sys.stderr),
+    app_dir=app_dir,
+    config_file=config_file,
+    default_dependency_manager=False,
+    default_resource_manager=False,
+)
+resources, _gas = controller.modify_resources(resources={"max": target, "min": 0})
+print(json.dumps({"mem_limit": int(MessageToDict(resources).get("memLimit", 0))}))
+"""
+# Seconds that the node has to answer a grow request.
+GROW_TIMEOUT_SECONDS = int(os.environ.get("PACKER_GROW_TIMEOUT_SECONDS", 120))
+
+
 class NodeControllerResourceManager:
     """Grow this microVM's RAM through celaut's ``node_controller`` library.
 
-    Mirrors celaut-basics/demo-service: it lazily builds a
+    Mirrors celaut-basics/demo-service: it builds a
     ``node_controller.controller.Controller`` from the config file the node mounts
     at ``/__config__`` (initial resources + gateway URL) and calls
     ``Controller.modify_resources({'max': needed, 'min': 0})`` to hotplug memory.
     The node hotplugs the granted RAM, which then shows up in the system-available
     accounting used by ``IOBigData.ram_pool``.
+
+    The call runs in a child process. ``node_controller`` registers its own copy of
+    ``celaut.proto`` in the default descriptor pool, and a second file with that
+    name and other content cannot be added to the pool that the packer already
+    filled with nodo's own ``protos/celaut_pb2``. A process of its own keeps each
+    copy to itself.
 
     It is a no-op (returns ``None``) whenever there is no node to reach — no config
     file, or ``node_controller``/its deps aren't importable (dev boxes, unit
@@ -69,45 +99,25 @@ class NodeControllerResourceManager:
         self._config_file = config_file
         self._app_dir = app_dir
         self._log = log
-        self._controller = None
-        self._resolved = False
-
-    def _get_controller(self):
-        if self._resolved:
-            return self._controller
-        self._resolved = True
-        try:
-            if not self._config_file or not os.path.exists(self._config_file):
-                return None  # not running inside a node -> keep static behaviour
-            from node_controller.controller.controller import Controller
-            # Only the resource-modify path is needed, so skip the dependency- and
-            # resource-manager background machinery the demo service spins up.
-            self._controller = Controller(
-                debug=lambda m: self._log(f"[node_controller] {m}"),
-                app_dir=self._app_dir,
-                config_file=self._config_file,
-                default_dependency_manager=False,
-                default_resource_manager=False,
-            )
-        except Exception as e:
-            self._log(f"[MEM] node_controller unavailable for modify_resources: {e}")
-            self._controller = None
-        return self._controller
 
     def modify_resources(self, min_bytes: int, max_bytes: Optional[int] = None) -> Optional[int]:
         """Ask the node to hotplug memory up to ``max_bytes`` (mirrors demo
         service: max=needed, min=0). Returns the granted ``mem_limit`` in bytes,
         or ``None`` when no request could be made."""
-        controller = self._get_controller()
-        if controller is None:
-            return None
+        if not self._config_file or not os.path.exists(self._config_file):
+            return None  # not running inside a node -> keep static behaviour
         target = int(max_bytes if max_bytes is not None else min_bytes)
+        # No PYTHONPATH and another cwd: the child must not import nodo's packer
+        # tree (src/, protos/), only the installed node_controller.
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
         try:
-            from google.protobuf.json_format import MessageToDict
-            _resources, _gas_amount = controller.modify_resources(
-                resources={'max': target, 'min': 0}
+            done = subprocess.run(
+                [sys.executable, "-c", _GROW_SCRIPT, self._config_file, self._app_dir, str(target)],
+                cwd="/", env=env, capture_output=True, text=True, timeout=GROW_TIMEOUT_SECONDS,
             )
-            granted = int(MessageToDict(_resources).get("memLimit", 0))
+            if done.returncode != 0:
+                raise RuntimeError((done.stderr or "").strip().splitlines()[-1:] or done.returncode)
+            granted = int(json.loads(done.stdout.strip().splitlines()[-1])["mem_limit"])
             self._log(
                 f"[MEM] node granted mem_limit={IOBigData.convert_size(granted)} "
                 f"(requested max={IOBigData.convert_size(target)})"
@@ -116,6 +126,7 @@ class NodeControllerResourceManager:
         except Exception as e:
             self._log(f"[MEM] modify_resources call failed: {e}")
             return None
+
 
 class IOBigData(metaclass=Singleton):
     class RamLocker(object):
@@ -159,7 +170,7 @@ class IOBigData(metaclass=Singleton):
         self.ram_pool = ram_pool_method if ram_pool_method is not None else default_ram_pool
 
         self.log = log
-        self.ram_locked = 0
+        self.ram_locked = 0  
         self.get_ram_avaliable = lambda: self.ram_pool() - self.ram_locked
         self.amount_lock = RLock()
 
@@ -172,6 +183,7 @@ class IOBigData(metaclass=Singleton):
         # (dev boxes, tests).
         self.resource_manager = resource_manager if resource_manager is not None else NodeControllerResourceManager(log=log)
         self._last_growth_target = 0  # largest mem_limit already requested from the node
+
 
     # General methods.
 
@@ -205,6 +217,88 @@ class IOBigData(metaclass=Singleton):
             self.log_snapshot(context=f"after-modify-resources granted={granted}")
 
     @staticmethod
+    def convert_size(size_bytes):
+        import math
+        if size_bytes == 0:
+            return "0B"
+        size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+        try:
+            i = int(math.floor(math.log(size_bytes, 1024)))
+            p = math.pow(1024, i)
+            s = round(size_bytes / p, 2)
+            return "%s %s" % (s, size_name[i])
+        except ValueError:
+            return "%s %s" % (size_bytes, size_name[0])
+
+    def snapshot(self) -> dict:
+        system_available = int(psutil.virtual_memory().available)
+        with self.amount_lock:
+            ram_locked = int(self.ram_locked)
+            pool_available = int(self.ram_pool())
+            effective_available = int(self.get_ram_avaliable())
+            with self.wait_lock:
+                waiting = int(self.waiting_bytes)
+                
+        return {
+            "pid": os.getpid(),
+            "system_available": system_available,
+            "pool_available": pool_available,
+            "ram_locked": ram_locked,
+            "effective_available": effective_available,
+            "waiting": waiting,
+        }
+
+    def log_snapshot(self, context: str) -> None:
+        snapshot = self.snapshot()
+        self.log(
+            "[MEM] "
+            f"{context} | pid={snapshot['pid']} | "
+            f"system_available={IOBigData.convert_size(snapshot['system_available'])} | "
+            f"pool_available={IOBigData.convert_size(snapshot['pool_available'])} | "
+            f"ram_locked={IOBigData.convert_size(snapshot['ram_locked'])} | "
+            f"effective_available={IOBigData.convert_size(snapshot['effective_available'])} | "
+            f"waiting={IOBigData.convert_size(snapshot['waiting'])}"
+        )
+
+    def __stats(self, message: str, comments: bool = True):
+        if comments:
+            with self.amount_lock:
+                nodo_rss, nodo_reserved = _get_nodo_ch_memory_stats()
+                current_python_rss = _python_rss_bytes()
+                
+                self.log('\n--------- ' + message + ' -------------')
+                self.log('SYSTEM AVAILABLE -> ' + IOBigData.convert_size(psutil.virtual_memory().available))
+                self.log('VMACHINES RSS     -> ' + IOBigData.convert_size(nodo_rss))
+                self.log('VMACHINES RESERVED -> ' + IOBigData.convert_size(nodo_reserved))
+                self.log('VMACHINES NOT USED   -> ' + IOBigData.convert_size(max(0, nodo_reserved - nodo_rss)))
+                self.log('DAEMON RSS      -> ' + IOBigData.convert_size(current_python_rss))
+                self.log('DAEMON RSS INI  -> ' + IOBigData.convert_size(self._initial_python_rss_bytes))
+                self.log('DAEMON RSS ON LOCK -> ' + IOBigData.convert_size(max(0, current_python_rss - self._initial_python_rss_bytes)))
+                self.log('RAM POOL        -> ' + IOBigData.convert_size(self.ram_pool()))
+                self.log('RAM LOCKED      -> ' + IOBigData.convert_size(self.ram_locked))
+                self.log('RAM AVAILABLE   -> ' + IOBigData.convert_size(self.get_ram_avaliable()))
+                with self.wait_lock:
+                    self.log('RAM WAITING     -> ' + IOBigData.convert_size(self.waiting_bytes))
+                self.log('-----------------------------------------\n')
+
+    # Gas manager methods.
+    def __push_wait_list(self, l: int):
+        with self.wait_lock:
+            self.waiting_bytes += l
+
+    def __pop_wait_list(self, l: int):
+        with self.wait_lock:
+            self.waiting_bytes -= l
+            if self.waiting_bytes < 0:
+                self.waiting_bytes = 0
+
+    def __can_lock_ram(self, ram_amount: int, *, inclusive: bool) -> bool:
+        with self.amount_lock:
+            available = self.get_ram_avaliable()
+            return available >= ram_amount if inclusive else available > ram_amount
+
+    # Manage resources methods.
+
     def convert_size(size_bytes):
         import math
         if size_bytes == 0:
@@ -348,7 +442,26 @@ class IOBigData(metaclass=Singleton):
                 return
 
 def could_ve_this_sysreq(sysreq: celaut_pb2.Sysresources) -> bool:
-    return IOBigData().prevent_kill(len=sysreq.mem_limit)  
+    """Is there room for an instance that would hold ``sysreq.mem_limit``?
+
+    For a *new* instance, whose whole footprint has yet to be found. An instance
+    that already exists must be asked about with ``could_ve_this_extra_memory``:
+    its current limit is already accounted for, so asking this about its new
+    absolute limit counts the same bytes twice.
+    """
+    return IOBigData().prevent_kill(len=sysreq.mem_limit)
+
+
+def could_ve_this_extra_memory(extra_mem_bytes: int) -> bool:
+    """Is there room for ``extra_mem_bytes`` *on top of* what is already held?
+
+    The question a resize asks. Growth is the only part of a resize that has to be
+    found anywhere: an instance shrinking, or re-affirming the limit it already
+    has, needs nothing from the pool.
+    """
+    if extra_mem_bytes <= 0:
+        return True
+    return IOBigData().prevent_kill(len=extra_mem_bytes)
 
 def _get_nodo_ch_memory_stats() -> tuple[int, int]:
     """Devuelve una tupla con (total_rss_bytes, total_reserved_bytes) en una sola pasada."""

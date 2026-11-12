@@ -1,4 +1,0 @@
-{
-    "include": ["src", "Cargo.toml", "Cargo.lock", "start.sh", ".service/pack_config.json"],
-    "ignore": ["target/", "tests/", "benches/", "*.md", ".env"]
-}

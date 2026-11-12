@@ -1,4 +1,0 @@
-{
-    "include": ["src", "build.gradle.kts", "settings.gradle.kts", "start.sh", ".service/pack_config.json"],
-    "ignore": ["build/", ".gradle/", "*.md"]
-}

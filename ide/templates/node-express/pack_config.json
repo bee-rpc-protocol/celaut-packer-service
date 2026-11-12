@@ -1,4 +1,0 @@
-{
-    "include": ["src", "package.json", "package-lock.json", "start.sh", ".service/pack_config.json"],
-    "ignore": ["node_modules/", "tests/", "**/*.test.js", "*.md", ".env", "coverage/"]
-}

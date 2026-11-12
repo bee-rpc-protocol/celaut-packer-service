@@ -2,21 +2,24 @@
 
 This service packs a project (a `service.json` + `Dockerfile` + sources) into a
 content-addressed `.celaut.bee`, exactly the way `nodo pack` does. It builds your
-service's filesystem with `docker buildx` **inside its own container**
-(docker-in-docker), so running it locally needs a privileged container.
+service's filesystem with a **BuildKit** daemon (`buildkitd` + `buildctl`, as nodo's
+own packer does) **inside its own container**, so running it locally needs a
+privileged container.
 
 ## Requirements
 
 - **Docker** on the host, able to run **`--privileged`** containers (the service
-  boots its own `dockerd` + `buildx` builder inside the container).
-- **x86_64 host** recommended. The image emulates `arm64` via qemu/binfmt, so
-  packing arm64 services works, but native amd64 is the fast path.
-- Outbound internet (buildx pulls the base images your `Dockerfile` references).
-- ~4 GB free disk for the nested image cache.
+  starts its own `buildkitd` inside the container).
+- Build the image for the architecture of the host (`amd64/` or `arm64/`). The
+  instance packs both: the other architecture runs under qemu (the handler is
+  registered in the kernel of the host while the container runs), and the native one
+  is the fast path.
+- Outbound internet (BuildKit pulls the base images your `Dockerfile` references).
+- ~4 GB free disk for the BuildKit cache.
 
-No `config.yaml` is needed. The determinism-critical settings are hardcoded in
-the source (`src/utils/hashing.py` → `sha3_256`, `src/packers/zip_with_dockerfile.py`
-→ `MIN_BUFFER_BLOCK_SIZE = 10 MiB`); runtime dirs come from `start.sh` env.
+No `config.yaml` is needed: `src/utils/config.py` answers the few keys that the packer
+reads from a table of defaults (hash `sha3_256`, `MIN_BUFFER_BLOCK_SIZE` 32 KiB, which
+does not change the id), and the directories come from the `start.sh` env.
 
 ## Build the image
 
@@ -27,27 +30,29 @@ cp -rL amd64 /tmp/packer-ctx
 docker build -t packer-service -f /tmp/packer-ctx/.service/Dockerfile /tmp/packer-ctx
 ```
 
-The build asserts the three baked-in source fixes are present (two determinism,
-one buildx-abspath) — if any is missing, the build fails on purpose.
+The build asserts the two baked-in determinism fixes are present, and that the packer
+and `node_controller` import — if one fails, the build fails on purpose.
 
 ## Run it
 
 The image has no `ENTRYPOINT` on purpose (nodo supplies it from `service.json`);
-locally, run `start.sh` yourself. `--privileged` is required for the nested
-`dockerd`.
+locally, run `start.sh` yourself. `--privileged` is required for `buildkitd` and for
+the qemu handler. Give the BuildKit data directory a **volume**: overlayfs does not
+work on top of the overlayfs of the container filesystem, and a `RUN` line would fail
+with `mount source: "overlay"`. (In the microVM the root filesystem is not an overlay.)
 
 ```bash
 docker run --rm --privileged \
   -p 8080:8080 \
-  -p 8443:8443 \
-  --name pkr packer-service /app/start.sh
+  -v packer-buildkit:/opt/nodo/buildkit/data \
+  --name pkr --entrypoint /bin/bash packer-service /app/start.sh
 ```
 
-Ports: `8080` = packer HTTP API, `8443` = browser VS Code IDE (optional).
+Port: `8080` = packer HTTP API.
 
-Wait for `[packer] listening on 0.0.0.0:8080` in the logs. (First boot may log
-`overlay2 not supported → vfs` depending on your kernel; that's fine — buildx
-uses its own `nodo-hostnet` BuildKit builder.)
+Wait for `[packer] listening on 0.0.0.0:8080` in the logs. (If the kernel has no
+overlayfs, `start.sh` logs that `buildkitd` did not start and retries with the native
+snapshotter.)
 
 ## Pack a service
 
@@ -57,8 +62,8 @@ success you get `200`, the `.celaut.bee` bytes as the body, and the id in the
 `X-Service-Id` response header. On failure you get `400` with a plain-text reason.
 
 ```bash
-cd examples/hello
-zip -r /tmp/hello.zip .
+cd examples/hello/amd64      # or arm64: one pack root for each architecture
+zip -qr /tmp/hello.zip .
 curl -sS -D - -o /tmp/hello.celaut.bee \
   --data-binary @/tmp/hello.zip \
   -H "Content-Type: application/zip" \
@@ -80,18 +85,14 @@ curl -sS -D - -o /tmp/packer.celaut.bee \
   http://localhost:8080/pack
 ```
 
-### Browser IDE (optional)
-
-Open <http://localhost:8443> for a full VS Code in the browser (code-server) with
-the example templates and a `pack-service` helper on the terminal PATH.
-
 ## Run the tests
 
-Pure-Python unit tests (no Docker needed — `bee_rpc` is stubbed):
+Pure-Python unit tests (no Docker or BuildKit needed). They need the packer's Python
+dependencies (`protobuf==4.23.3`, `bee_rpc` v0.0.3, `psutil`, `mnemonic`, `cryptography`,
+`requests`):
 
 ```bash
-python -m unittest tests.test_serialize_bee
-python -m unittest tests.test_registry_endpoint
+python -m unittest discover -s tests
 ```
 
 ## Layout
@@ -99,5 +100,8 @@ python -m unittest tests.test_registry_endpoint
 - `src/` — the packer source shipped to `/opt/nodo` (outer `src/` mirrors the
   `/opt/nodo` payload; inner `src/` is the Python package: `src.packers`, `src.utils`).
 - `server.py` — the HTTP wrapper (`/pack`, `/registry/<id>`).
-- `start.sh` — boots dockerd + buildx and launches the packer server.
-- `examples/hello` — a reproducible reference service used to smoke-test packing.
+- `start.sh` — starts buildkitd, registers qemu, launches the packer
+  server, and reads the notices of the node.
+- `amd64/`, `arm64/` — the pack roots of this service (`.service/` + links to the sources).
+- `examples/hello` — a reproducible reference service used to smoke-test packing (one
+  pack root for each architecture).

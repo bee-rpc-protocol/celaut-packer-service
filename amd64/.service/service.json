@@ -1,6 +1,7 @@
 {
-  "tag": ["celaut-packer-service", "packer", "ide", "v0.2.0"],
+  "tag": ["celaut-packer-service", "packer", "v0.3.0"],
   "architecture": "linux/amd64",
+  "uses_gateway": true,
   "init": {
     "entry_path": ["app", "start.sh"]
   },
@@ -8,12 +9,13 @@
     {
       "port": 8080,
       "transport": ["tcp"],
-      "protocol": ["http"]
-    },
-    {
-      "port": 8443,
-      "transport": ["tcp"],
-      "protocol": ["http"]
+      "protocol_stack": [
+        ["http"],
+        {
+          "tags": ["celaut-packer"],
+          "prose": "Packer API: the same as `nodo pack`, over HTTP. POST /pack takes a project zip (a Dockerfile, a service.json and optionally a pack_config.json) and answers a .celaut.bee, with the service id in the X-Service-Id header. GET /health answers ok. GET and POST /registry/<id> let a client upload an already packed dependency before it packs. Builds linux/amd64 and linux/arm64."
+        }
+      ]
     }
   ],
   "resources": {
@@ -29,7 +31,7 @@
   "network": [
     {
       "tags": ["*"],
-      "prose": "Unrestricted outbound internet. The packer runs Docker/buildx inside the sealed microVM and must reach arbitrary container registries (Docker Hub, ghcr.io, etc.) to pull the base images referenced by the Dockerfile being packed. tag=(*) declares an unconstrained egress channel."
+      "prose": "Unrestricted outbound internet. The packer runs BuildKit inside the sealed microVM and must reach arbitrary container registries (Docker Hub, ghcr.io, etc.) to pull the base images referenced by the Dockerfile being packed. tag=(*) declares an unconstrained egress channel."
     }
   ]
 }

@@ -8,12 +8,13 @@ containing a Dockerfile, a packer config and a service.json, it builds the
 image, exports its filesystem, serialises a content-addressed `celaut.Service`
 protobuf, and returns the packed service as a single `.celaut.bee` file.
 
-It does NOT re-implement the packer. It ships the real packer source in-repo
-(src/, COPYed to /opt/nodo at image-build time — no clone of nodo) and invokes
-its worker entrypoint, so the service-id produced here is byte-identical to
-`nodo pack`. Docker/buildx runs
-inside this microVM (docker-in-docker); that is why the service declares
-`network: tag=(*)` — buildx must reach arbitrary registries to pull base images.
+It does NOT re-implement the packer. It ships the packer source of nodo's `dev`
+branch in-repo (src/, COPYed to /opt/nodo at image-build time — no clone of nodo)
+and invokes its worker entrypoint, so the service-id produced here is
+byte-identical to `nodo pack`. BuildKit runs
+inside this microVM through a BuildKit daemon that the worker drives with
+`buildctl`, as nodo's own packer does; that is why the service declares
+`network: tag=(*)` — BuildKit must reach arbitrary registries to pull base images.
 
 API (bound on 0.0.0.0:8080):
   GET  /health            -> 200 "ok"
@@ -48,18 +49,23 @@ API (bound on 0.0.0.0:8080):
                                     (valid JSON, architecture, entrypoint, api
                                     slots, pack_config) and any problems are
                                     returned as a numbered, plain-English list
-                                    pointing at SERVICE_CONFIG_GUIDE.md, so a bad
+                                    pointing at nodo's docs/PACKING.md, so a bad
                                     config never reaches a cryptic build failure.
                              415 -> bad/missing zip
 
-The zip must contain (at its root, or in a single top-level folder):
+The zip is either the `.service.zip` that `nodo pack` sends, or the project
+itself, which is prepared as nodo prepares it (project files under service/, the
+`./` COPY sources rewritten to `service/`, `include`/`ignore`/`.dockerignore`
+applied). It must contain (at its root, or in a single top-level folder):
   - Dockerfile           (root or .service/)
   - service.json         (root or .service/)
-  - pack_config.json     (optional; honoured by the nodo packer's ignore globs)
+  - pack_config.json     (optional)
 """
 import base64
 import json
 import os
+import pathlib
+import platform
 import re
 import shutil
 import subprocess
@@ -70,19 +76,33 @@ import uuid
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# src/utils/block_tree.py is pure stdlib: the blocks that a packed service needs.
+# It lives in the packer tree (/opt/nodo in the image; the outer src/ in a checkout).
+for _root in (os.environ.get("NODO_DIR", "/opt/nodo"),
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")):
+    if os.path.isfile(os.path.join(_root, "src", "utils", "block_tree.py")):
+        sys.path.insert(0, _root)
+        break
+from src.utils.block_tree import (  # noqa: E402
+    InvalidBlockIdError, MissingManifestError, block_tree,
+)
+
 # Where the nodo source tree is vendored in the image (see Dockerfile).
 NODO_DIR = os.environ.get("NODO_DIR", "/opt/nodo")
 PORT = int(os.environ.get("PORT", "8080"))
 MAX_ZIP_BYTES = int(os.environ.get("MAX_ZIP_BYTES", str(512 * 1024 * 1024)))  # 512MB
-# The packer service itself runs on an amd64 host. With qemu/binfmt registered
-# in the in-VM Docker (see start.sh), buildx can ALSO emulate arm64 — so this
-# packer builds amd64 natively and arm64 via emulation.
-PACKER_ARCH = os.environ.get("PACKER_ARCH", "linux/amd64")  # default suggested in errors
+# This packer builds the architecture of its own guest natively, and the other one
+# through the qemu/binfmt handler that start.sh registers (src/utils/arch_guard.py
+# refuses a foreign build when the handler is missing).
+PACKER_ARCH = os.environ.get(  # default suggested in errors
+    "PACKER_ARCH",
+    "linux/arm64" if platform.machine().lower() in ("aarch64", "arm64") else "linux/amd64",
+)
 SUPPORTED_ARCHES = {
     a.strip() for a in os.environ.get(
         "PACKER_ARCHES", "linux/amd64,linux/arm64").split(",") if a.strip()
 }
-GUIDE = "SERVICE_CONFIG_GUIDE.md"
+GUIDE = "docs/PACKING.md of nodo (https://github.com/celaut-project/nodo/blob/dev/docs/PACKING.md)"
 
 # The nodo ConfigManager reads these; start.sh exports them too. Kept here so the
 # server is runnable/inspectable on its own.
@@ -124,21 +144,21 @@ def _registry_dirs():
 def _registry_status(service_id: str):
     """Return a dict describing whether <service_id> is present in the packer's
     registry (and, if so, whether metadata + which blocks are there), or None if
-    the service dir isn't present at all."""
-    registry, metadata, _blocks = _registry_dirs()
-    service_dir = os.path.join(registry, service_id)
-    if not os.path.isdir(service_dir):
+    the service isn't present at all.
+
+    A packed service is a multiblock directory (its `_.json` names the blocks), or
+    one file when it has no blocks. The blocks listed are all of those that the
+    service needs, at every depth (a block can be a multiblock directory too)."""
+    registry, metadata, blockdir = _registry_dirs()
+    service_path = os.path.join(registry, service_id)
+    if not os.path.exists(service_path):
         return None
     blocks = []
-    manifest = os.path.join(service_dir, "_.json")
-    if os.path.exists(manifest):
+    if os.path.isdir(service_path):
         try:
-            with open(manifest) as f:
-                for entry in json.load(f):
-                    if isinstance(entry, list) and entry:
-                        blocks.append(entry[0])
-        except Exception:
-            pass
+            blocks = block_tree(service_path, blockdir)
+        except (OSError, ValueError, MissingManifestError, InvalidBlockIdError):
+            blocks = []
     return {
         "present": True,
         "metadata": os.path.exists(os.path.join(metadata, service_id)),
@@ -164,8 +184,9 @@ def _store_registry_bundle(service_id: str, bundle_path: str) -> dict:
     later /pack can resolve `service_id` as a registry dependency.
 
     `bundle_path` is a gzip tar with this layout (all paths relative to root):
-        service/          -> the packed service's multiblock dir; its contents
-                             become {REGISTRY}/{service_id}/ (must contain _.json)
+        service           -> the packed service: a multiblock dir (must contain
+                             _.json), or one file when it has no blocks. It becomes
+                             {REGISTRY}/{service_id}
         metadata          -> optional; the Metadata protobuf, copied verbatim to
                              {METADATA_REGISTRY}/{service_id}
         blocks/<blockid>  -> optional; content-addressed shared block files, each
@@ -185,20 +206,22 @@ def _store_registry_bundle(service_id: str, bundle_path: str) -> dict:
             _safe_extract_tar(tf, extract)
 
         src_service = os.path.join(extract, "service")
-        if not os.path.isdir(src_service):
+        if os.path.isdir(src_service):
+            if not os.path.exists(os.path.join(src_service, "_.json")):
+                raise RuntimeError(
+                    "bundle 'service/' has no _.json manifest — not a packed service "
+                    "directory.")
+        elif not os.path.isfile(src_service):
             raise RuntimeError(
-                "bundle is missing a top-level 'service/' directory (the packed "
-                "service's multiblock dir).")
-        if not os.path.exists(os.path.join(src_service, "_.json")):
-            raise RuntimeError(
-                "bundle 'service/' has no _.json manifest — not a packed service "
-                "directory.")
+                "bundle is missing a top-level 'service' entry (the packed "
+                "service: a multiblock directory, or one file when it has no "
+                "blocks).")
 
         service_dir = os.path.join(registry, service_id)
-        already_present = os.path.isdir(service_dir)
+        already_present = os.path.exists(service_dir)
         if not already_present:
-            # Atomic-ish publish: move the fully-extracted dir into place.
-            os.replace(src_service, service_dir)
+            # Atomic-ish publish: move the fully-extracted service into place.
+            shutil.move(src_service, service_dir)
 
         # Metadata (a single file) — write if provided and not already there.
         src_meta = os.path.join(extract, "metadata")
@@ -268,7 +291,7 @@ def _load_json(path: str):
 def _validate_service_config(project: str):
     """Pre-flight check of the .service configuration. Returns a list of
     plain-English problems ("what's wrong + how to fix"). An empty list means the
-    config is structurally sound (the Docker build may still fail for other
+    config is structurally sound (the build may still fail for other
     reasons, which are surfaced separately with the build log)."""
     problems = []
 
@@ -313,8 +336,30 @@ def _validate_service_config(project: str):
     elif entry is not None and not isinstance(entry, (str, list)):
         problems.append('init.entry_path must be a string ("app/start.sh") or an '
                         'array of segments (["app", "start.sh"]).')
+    else:
+        # The node refuses to run an entry path with whitespace, "." or ".." (the
+        # entry path is a path only: put the arguments in your entrypoint script).
+        segments = entry if isinstance(entry, list) else str(entry or "").split("/")
+        if any(not isinstance(x, str) for x in segments):
+            problems.append('init.entry_path segments must be strings.')
+        elif any(re.search(r"\s", x) for x in segments):
+            problems.append('init.entry_path must be a single path: no spaces and '
+                            'no CLI arguments. Put the flags inside your '
+                            f'entrypoint script. ({GUIDE} → init)')
+        elif any(x in (".", "..") for x in segments):
+            problems.append('init.entry_path must not contain "." or ".." segments.')
 
-    # api slots — optional, but validate shape when present.
+    # tag — a string or an array of strings.
+    tag = sj.get("tag")
+    if tag is not None and not (
+        isinstance(tag, str)
+        or (isinstance(tag, list) and all(isinstance(t, str) for t in tag))
+    ):
+        problems.append('"tag" must be a string or an array of strings.')
+
+    # api slots — optional, but validate shape when present. A slot speaks one
+    # application "protocol" or a "protocol_stack" of several layers; both are
+    # optional, and a slot does not declare the two.
     api = sj.get("api")
     if api is not None:
         if not isinstance(api, list):
@@ -333,14 +378,97 @@ def _validate_service_config(project: str):
                 elif not 1 <= port <= 65535:
                     problems.append(f'api[{i}].port {port} is out of range '
                                     '(1–65535).')
-                if "protocol" not in slot:
-                    problems.append(f'api[{i}] has no "protocol" — add e.g. '
-                                    '"protocol": ["http"] or ["grpc"].')
+                if "protocol" in slot and "protocol_stack" in slot:
+                    problems.append(f'api[{i}] declares both "protocol" and '
+                                    '"protocol_stack": use one ("protocol" is a '
+                                    f'single layer). ({GUIDE} → api)')
+                if "protocol_stack" in slot and not isinstance(
+                        slot["protocol_stack"], list):
+                    problems.append(f'api[{i}].protocol_stack must be an array of '
+                                    'layers, e.g. [["http2"], ["grpc"]].')
+                mu = slot.get("mu_per_call")
+                if mu is not None and not (
+                    isinstance(mu, dict)
+                    and all(isinstance(v, int) and not isinstance(v, bool)
+                            for v in mu.values())
+                ):
+                    problems.append(f'api[{i}].mu_per_call must be an object of '
+                                    'method name → integer price.')
 
-    # network — optional.
-    if sj.get("network") is not None and not isinstance(sj["network"], list):
-        problems.append('"network" must be an array of { "tags": [...], '
-                        '"prose": "..." } entries.')
+    # network — optional. Every entry needs "tags" and "prose".
+    network = sj.get("network")
+    if network is not None:
+        if not isinstance(network, list):
+            problems.append('"network" must be an array of { "tags": [...], '
+                            '"prose": "..." } entries.')
+        else:
+            for i, entry_net in enumerate(network):
+                if not isinstance(entry_net, dict):
+                    problems.append(f'network[{i}] must be an object with "tags" '
+                                    'and "prose".')
+                    continue
+                for key in ("tags", "prose"):
+                    if key not in entry_net:
+                        problems.append(f'network[{i}] has no "{key}" — both '
+                                        '"tags" and "prose" are required.')
+                if "formal" in entry_net and not (
+                    isinstance(entry_net["formal"], dict)
+                    and all(isinstance(v, str) for v in entry_net["formal"].values())
+                ):
+                    problems.append(f'network[{i}].formal must be an object of '
+                                    'string → string (a number is refused: write '
+                                    'it as a JSON string).')
+
+    # envs — names only.
+    envs = sj.get("envs")
+    if envs is not None and not (
+        isinstance(envs, list) and all(isinstance(e, str) for e in envs)
+    ):
+        problems.append('"envs" must be an array of environment variable NAMES, '
+                        'e.g. ["MY_ENV_VAR"].')
+
+    # Booleans: a string "true" is an error, not a yes (the packer refuses it too).
+    for key in ("read_only_filesystem", "uses_gateway"):
+        if key in sj and not isinstance(sj[key], bool):
+            problems.append(f'"{key}" must be the JSON boolean true or false, not '
+                            f'{sj[key]!r}.')
+
+    # notice_declaration — an object, or false for "no notice".
+    notice = sj.get("notice_declaration")
+    if notice is not None and notice is not False and not isinstance(notice, dict):
+        problems.append('"notice_declaration" must be an object, or false when the '
+                        f'service does not read /dev/hvc0. ({GUIDE} → notice_declaration)')
+
+    # shared_filesystems — a list of objects; the packer checks each one.
+    shared = sj.get("shared_filesystems")
+    if shared is not None and not (
+        isinstance(shared, list) and all(isinstance(x, dict) for x in shared)
+    ):
+        problems.append('"shared_filesystems" must be an array of objects with '
+                        '"path" and "role".')
+
+    # resources — at_init / at_most; the per-core benchmark is only an at_init key.
+    resources = sj.get("resources")
+    if resources is not None:
+        if not isinstance(resources, dict):
+            problems.append('"resources" must be an object with "at_init" and '
+                            '"at_most".')
+        else:
+            for end in ("at_init", "at_most"):
+                block = resources.get(end)
+                if block is not None and not isinstance(block, dict):
+                    problems.append(f'resources.{end} must be an object.')
+            at_most = resources.get("at_most")
+            if isinstance(at_most, dict) and "benchmark" in at_most:
+                problems.append('resources.at_most.benchmark has no meaning: a '
+                                'per-core minimum belongs in '
+                                'resources.at_init.benchmark.')
+
+    # Descendant workloads — arrays of clauses (the packer checks the shape).
+    for key in ("initial_environment_workload", "possible_environment_workload"):
+        if sj.get(key) is not None and not isinstance(sj[key], list):
+            problems.append(f'"{key}" must be an array of {{ "any_of": [...] }} '
+                            f'clauses. ({GUIDE} → {key})')
 
     # pack_config.json — optional; validate JSON + the dependencies_env/array trap.
     pc_path = _locate_config(project, "pack_config.json")
@@ -357,6 +485,117 @@ def _validate_service_config(project: str):
                 f'name. ({GUIDE} → dependencies_env)')
 
     return problems
+
+
+def _rewrite_copy_sources(dockerfile: str) -> None:
+    """The COPY rewrite of nodo's prepare_directory. The build context is the
+    directory that holds `service/` (the project files), so every context source of
+    a COPY that starts with "." gets the `service/` prefix (`./src` -> `service/src`).
+    A COPY with `--from=<stage>` names a build stage, not the context: untouched."""
+    with open(dockerfile, "r") as f:
+        lines = f.readlines()
+    with open(dockerfile, "w") as f:
+        for line in lines:
+            if line.strip().startswith("COPY "):
+                parts = line.split()
+                flags = [x for x in parts[1:] if x.startswith("--")]
+                if len(parts) >= 3 and not any(x.startswith("--from") for x in flags):
+                    start = 1
+                    while start < len(parts) and parts[start].startswith("--"):
+                        start += 1
+                    for j in range(start, len(parts) - 1):  # the sources, not the dest
+                        if parts[j].startswith("."):
+                            parts[j] = "service" + parts[j][1:]
+                    line = " ".join(parts) + "\n"
+            f.write(line)
+
+
+def _is_prepared_context(project: str) -> bool:
+    """True when the zip is what `nodo pack` sends (its `.service.zip`): the
+    Dockerfile and service.json at the root and the project files in `service/`.
+    Nothing to prepare then."""
+    return (
+        not os.path.isdir(os.path.join(project, ".service"))
+        and os.path.isdir(os.path.join(project, "service"))
+        and os.path.exists(os.path.join(project, "Dockerfile"))
+        and os.path.exists(os.path.join(project, "service.json"))
+    )
+
+
+def _stage_context(project: str, dest: str) -> str:
+    """Prepare a project zipped as it is, the way `nodo pack` does before it sends
+    it (prepare_directory + generate_service_zip), so that a Dockerfile builds here
+    as it builds there and the service id is the same.
+
+    The context is a directory with `Dockerfile`, `service.json` and
+    `pack_config.json` at its root and the project files under `service/`:
+      * the configuration comes from `.service/` or from the project root;
+      * `include` (only these paths) and `ignore` (patterns, matched at every depth,
+        plus the lines of `.dockerignore`) choose the project files;
+      * the COPY sources that start with "." get the `service/` prefix.
+    A zip that is already prepared (see _is_prepared_context) is used as it is.
+    Returns the context directory.
+    """
+    if _is_prepared_context(project):
+        return project
+    svc = os.path.join(project, ".service")
+
+    def config_path(name):
+        for base in (svc, project):
+            candidate = os.path.join(base, name)
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    pack_config = {}
+    pc_path = config_path("pack_config.json")
+    if pc_path:
+        loaded, _err = _load_json(pc_path)
+        pack_config = loaded if isinstance(loaded, dict) else {}
+
+    files_dir = os.path.join(dest, "service")
+    os.makedirs(files_dir, exist_ok=True)
+    include = pack_config.get("include")
+    names = include if isinstance(include, list) else [
+        n for n in os.listdir(project) if n != ".service"]
+    for name in names:
+        rel = str(name).strip("/")
+        src = os.path.join(project, rel)
+        # `include` can list ".service/pack_config.json": it is not project content.
+        if not rel or rel.startswith(".service") or not os.path.exists(src):
+            continue
+        target = os.path.join(files_dir, rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if os.path.isdir(src):
+            shutil.copytree(src, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, target)
+
+    patterns = list(pack_config.get("ignore") or [])
+    ignore_file = config_path(".dockerignore")
+    if ignore_file:
+        with open(ignore_file, encoding="utf-8") as f:
+            patterns += f.read().splitlines()
+    root = pathlib.Path(files_dir)
+    for pattern in patterns:
+        pattern = str(pattern).strip()
+        if not pattern or pattern.startswith(("#", "!")):
+            continue
+        pattern = pattern.rstrip("/")
+        if not pattern:
+            continue
+        for found in root.rglob(pattern):
+            if found.is_dir():
+                shutil.rmtree(found, ignore_errors=True)
+            else:
+                found.unlink(missing_ok=True)
+
+    for name in ("Dockerfile", "service.json", "pack_config.json"):
+        src = config_path(name)
+        if src:
+            shutil.copy2(src, os.path.join(dest, name))
+    _rewrite_copy_sources(os.path.join(dest, "Dockerfile"))
+    return dest.rstrip("/") + "/"
 
 
 def _flatten_single_root(extract_dir: str) -> str:
@@ -464,7 +703,7 @@ def _serialize_bee(service_dir: str, metadata_bytes: bytes) -> bytes:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "celaut-packer/0.1"
+    server_version = "celaut-packer/0.3"
 
     def _send(self, code, body=b"", ctype="text/plain; charset=utf-8", headers=None):
         if isinstance(body, str):
@@ -567,6 +806,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._send(400, body)
 
+            # A project that is not what `nodo pack` sends gets prepared as nodo
+            # prepares it: the context of the worker.
+            project = _stage_context(project, os.path.join(work, "context"))
+
             # Re-zip the (possibly flattened) project for the worker, which unzips
             # to its own cache. Mirrors nodo's zipfile_ok contract.
             norm_zip = os.path.join(work, "project.zip")
@@ -592,7 +835,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400,
                 "Packing failed while building your service:\n\n"
                 f"{e}\n\n"
-                "This is usually a Docker build error, not a config-shape problem. "
+                "This is usually a build error, not a config-shape problem. "
                 "Common causes: a COPY referencing a file that isn't in the build "
                 "context, a base image that can't be pulled, or a RUN step that "
                 f"exits non-zero. See {GUIDE} → Common Issues.")

@@ -1,4 +1,0 @@
-{
-    "include": ["src", "pom.xml", "start.sh", ".service/pack_config.json"],
-    "ignore": ["target/", "*.md", ".mvn/", "**/*.class"]
-}

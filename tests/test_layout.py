@@ -15,7 +15,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARCHES = ("amd64", "arm64")
 SERVICE_FILES = ("Dockerfile", "service.json", "pack_config.json", ".dockerignore")
-SHARED = ("src", "ide", "server.py", "start.sh")
+SHARED = ("src", "server.py", "start.sh")
 
 
 def _read(path):
@@ -49,17 +49,17 @@ class PerArchitectureLayoutTests(unittest.TestCase):
         self.assertEqual(manifests[0], manifests[1])
 
     def test_the_files_that_are_not_the_manifest_are_the_same(self):
-        for name in ("Dockerfile", "pack_config.json", ".dockerignore"):
+        for name in ("pack_config.json", ".dockerignore"):
             a, b = (_read(os.path.join(ROOT, arch, ".service", name)) for arch in ARCHES)
             self.assertEqual(a, b, name)
 
-    def test_pack_config_does_not_hide_the_docs_that_the_image_copies(self):
-        # nodo applies the `ignore` of .service/pack_config.json to the whole tree: a `*.md`
-        # there removes ide/SERVICE_CONFIG_GUIDE.md, which the Dockerfile copies. The patterns
-        # that keep the context clean are in .dockerignore.
-        for arch in ARCHES:
-            config = json.loads(_read(os.path.join(ROOT, arch, ".service", "pack_config.json")))
-            self.assertNotIn("*.md", config.get("ignore", []))
+    def test_the_dockerfiles_differ_only_in_their_first_comment(self):
+        # As in celaut-basics: the first three lines say which variant it is.
+        a, b = (_read(os.path.join(ROOT, arch, ".service", "Dockerfile")).split("\n")
+                for arch in ARCHES)
+        self.assertEqual(a[3:], b[3:])
+        for arch, lines in zip(ARCHES, (a, b)):
+            self.assertIn(f"linux/{arch} variant", lines[0])
 
     def test_the_shared_sources_are_symlinks_to_the_root(self):
         for arch in ARCHES:

@@ -1,3 +1,11 @@
 {
-  "ignore": []
+  "include": [
+    "src",
+    "server.py",
+    "start.sh"
+  ],
+  "ignore": [
+    "__pycache__/",
+    "*.pyc"
+  ]
 }

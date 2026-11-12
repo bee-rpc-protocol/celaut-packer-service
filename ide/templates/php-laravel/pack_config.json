@@ -1,4 +1,0 @@
-{
-    "include": ["src", "composer.json", "composer.lock", "start.sh", ".service/pack_config.json"],
-    "ignore": ["vendor/", "node_modules/", "tests/", "*.md", ".env", ".env.*", "storage/logs/*"]
-}

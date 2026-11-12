@@ -1,0 +1,772 @@
+"""
+Node identity keypair (issue #236): a node's own Ed25519 keypair, derived from a BIP-39
+mnemonic of its own. Used as the ``peer_id`` a node presents to others and to sign its
+``GetPeerInfo`` response (``Peer.public_key`` / ``Peer.signature``).
+
+The identity is deliberately not a wallet on any ledger, tempting though it is to make
+a reputation proof's R7 owner *be* the ``peer_id``: the comparison would be free, and
+the price is permanent. R7 is the reputation contract's spending clause
+(``INPUTS.exists { b.propositionBytes == SELF.R7[Coll[Byte]].get }``), so it can hold
+nothing but an Ergo proposition -- an identity read out of it is an identity that must
+stay spendable on Ergo forever, which makes Ergo a dependency of the peer-to-peer
+layer, down to a node with no wallet being unable to serve or dial at all.
+
+What ties an identity to a ledger is an attestation: the wallet that published a
+reputation proof signs this node's ``peer_id``, and the pair rides in that proof's own
+xattrs -- per proof, because a node holds as many as it likes (issue #281) and nothing
+says they share an owner. A reader
+checks two links instead of comparing bytes -- the R7 owner is the attested wallet, and
+that wallet signed this ``peer_id`` -- which is the same fact, verifiable from the
+proof box alone with no round-trip to the node, and it holds for a second ledger
+without privileging the first. It is the shape payment already has
+(``Peer.payment_contracts`` is a menu the payer picks from), applied to reputation and
+identity.
+
+There is exactly ONE identity mnemonic per node, ``identity.MNEMONIC``, generated on
+first config load when unset. It never changes underneath the peers that recorded it,
+and it is independent of every ``ledgers.*.WALLET_MNEMONIC``: adding, removing or
+rotating a wallet leaves the node's name alone.
+"""
+import hashlib
+import itertools
+import string
+from functools import lru_cache
+from typing import Dict, Final, NamedTuple, Optional, Tuple
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from mnemonic import Mnemonic
+
+from protos import celaut_pb2
+from src.utils.config import ConfigManager
+from src.utils import keyvalue
+
+# A raw Ed25519 public key is 32 bytes -> 64 hex characters.
+_PUBLIC_KEY_HEX_LENGTH = 64
+_HEX_DIGITS = frozenset(string.hexdigits.lower())
+
+# Where the identity mnemonic lives. Deliberately not under `ledgers`: an identity that
+# reads its key out of one ledger's section is an identity that ledger owns.
+IDENTITY_MNEMONIC_KEY: Final[str] = "identity.MNEMONIC"
+
+# Ed25519 takes a 32-byte seed, and BIP-39 yields 64. Rather than truncate -- which
+# would make the identity key a prefix of anything else derived from that seed -- the
+# seed is hashed with a personalisation string, so the same mnemonic could back another
+# key for another purpose without either being derivable from the other. Blake2b for
+# the same reason the peer digest uses it: one hash family across the identity path.
+_SEED_PERSONALISATION: Final[bytes] = b"celaut-id"
+
+# Domain separation for a ledger attestation, so a wallet signature made to vouch for a
+# peer_id can never be replayed as a signature over something else that wallet signs
+# (an IOU note, a reputation payload) and the other way round.
+_ATTESTATION_PREFIX: Final[str] = "celaut-ledger-attestation:"
+
+# Domain separation for binding a client_id to the peer requesting it
+# (GenerateClient, see gateway.GenerateClient / manager.generate_client_or_pow_required),
+# for the same reason: this node's identity key also signs a Peer announcement
+# (canonical_peer_payload) and, for a ledger wallet, an attestation -- without a
+# distinct prefix a signature made for one could be replayed as another.
+_CLIENT_BINDING_PREFIX: Final[str] = "celaut-client-binding:"
+
+# Domain separation for a balance statement (#570): the movements of an account that
+# this node signs for its owner, who can hold it up as evidence of a charge.
+_STATEMENT_PREFIX: Final[str] = "celaut-balance-statement:"
+
+# Domain separation for an execution receipt (#419, docs/EXECUTION_RECEIPTS.md): what
+# this node signs about one execution it runs, which a client can hold up against it.
+_RECEIPT_PREFIX: Final[str] = "celaut-execution-receipt:"
+
+
+def component_formal(pairs: Dict[str, str]) -> bytes:
+    """``key=value`` lines, sorted by key, UTF-8: the canonical body of a ``formal``.
+
+    Sorted so two nodes that declare the same parameters produce identical bytes
+    whatever order they built them in -- this value is compared byte for byte, and it is
+    covered by the announcement's signature, so it must not depend on iteration order.
+
+    Lives beside the comparison rather than beside either of its callers: a signature
+    scheme and an address's protocol stack are compared by the same function, so what
+    they put in the field it reads has to be built the same way.
+    """
+    return "\n".join(f"{key}={pairs[key]}" for key in sorted(pairs)).encode("utf-8")
+
+
+class ComponentFormalError(ValueError):
+    """A ``formal`` field could not be read as :func:`component_formal` bytes.
+
+    Raised rather than returning what could be salvaged: a declaration this node
+    cannot read whole is not a declaration that asked for less.
+    """
+
+
+def parse_component_formal(formal: bytes) -> Dict[str, str]:
+    """The inverse of :func:`component_formal`: ``key=value`` lines back into pairs.
+
+    Written beside it because the two have to agree, and because the field is
+    authored by hand as often as it is built here -- a service spec carries its
+    ``formal`` as literal bytes, and whoever typed them gets an error naming the line
+    rather than a requirement silently missing a key.
+
+    ``=`` splits on its **first** occurrence, so a value may contain one; a key may
+    not, which costs nothing (keys here are identifiers) and is what keeps the
+    encoding unambiguous in the direction that matters. A newline cannot appear in
+    either, since it is the separator -- a component needing one is a component whose
+    ``formal`` should point at a document instead of carrying it.
+
+    Leading and trailing whitespace around the *document* is ignored, because a
+    hand-written field arrives with a trailing newline more often than not. Nothing
+    inside it is: a blank line, a line without ``=``, an empty key or a repeated key
+    are each refused, the last one because two values for one key is a question this
+    cannot answer by picking one.
+    """
+    try:
+        text = bytes(formal).decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ComponentFormalError(f"formal is not UTF-8: {e}") from None
+
+    text = text.strip()
+    if not text:
+        return {}
+
+    pairs: Dict[str, str] = {}
+    for number, line in enumerate(text.split("\n"), start=1):
+        if "=" not in line:
+            raise ComponentFormalError(
+                f"formal line {number} is not a 'key=value' pair: {line!r}."
+            )
+        key, value = line.split("=", 1)
+        if not key:
+            raise ComponentFormalError(f"formal line {number} has an empty key: {line!r}.")
+        if key in pairs:
+            raise ComponentFormalError(
+                f"formal declares {key!r} twice (line {number}). Which value was meant "
+                "is not something this can decide, so neither is taken."
+            )
+        pairs[key] = value
+    return pairs
+
+
+class SignatureSchemeComponent(NamedTuple):
+    """One building block of a signature scheme, in celaut's tags/prose/formal shape.
+
+    ``formal`` belongs to the component it describes, not to the scheme around it: it
+    is what :func:`same_component` compares whenever both sides carry one, so a single
+    value shared across every component would make them all interchangeable -- and a
+    peer repeating that one value on however many components would match whatever its
+    tags said.
+
+    It defaults to empty, for a component whose identity its tags carry on their own.
+    A block with a specification document, or the content hash of a verifier service,
+    puts it here and that becomes the part deciding for it -- the Ergo ledger
+    (``reputation_system/envs.py``) is the case with nothing to point at.
+    """
+
+    tags: Tuple[str, ...]
+    prose: str
+    formal: bytes = b""
+
+
+# The cryptography this node's identity signatures are in, announced on
+# ``Peer.signature_scheme`` and demanded of every peer it registers.
+#
+# A scheme is an unordered stack of components (``Peer.SignatureScheme.components``,
+# each a ``tags``/``prose``/``formal`` descriptor exactly like ``Uri.Protocol`` or
+# ``Contract.Ledger``) -- one per building block, rather than a fixed set of named
+# fields, so a future scheme with a different shape (hash-based, threshold, no curve
+# at all) needs no proto migration to be expressed, only a different-length stack.
+#
+# A descriptor, not an id derived from one: celaut never names a tags/prose/formal
+# component by a hash of itself (compare ``ledger_descriptors.ergo_payment_ledger``, whose
+# ``formal`` is the declaration itself), and doing it here would invent a naming rule for signature schemes that
+# nothing else in the protocol follows. The descriptor IS the name, and deciding
+# whether two of them denote the same thing is a comparison -- one a service of the
+# shape ``(scheme_a, scheme_b) -> bool`` can eventually make better than this node
+# does (see :func:`same_signature_scheme`).
+#
+# Order carries no meaning (curve, algorithm, hash, ledger convention only because
+# that is the order a reader meets them in below); each entry is a
+# :class:`SignatureSchemeComponent`, carrying its own ``formal``.
+# Prose is read by whoever receives the announcement, so each block states itself and
+# nothing about this implementation of it: a reader holding only the Peer message --
+# off a gRPC response, or off an Ergo register -- cannot follow a path into some
+# repository, and naming other projects only moves the question along ("and what is
+# that?"). Same reason a ledger's prose (src/utils/ledger_descriptors.py) describes the
+# chain and not nodo's client for it. It says everything a verification has to be written from and stands on its own,
+# because `formal` beside it names the same parameters without describing any of them:
+# the two are one declaration read at two levels of detail, and only `formal` is
+# compared.
+SIGNATURE_SCHEME_COMPONENTS: Final[Tuple[SignatureSchemeComponent, ...]] = (
+    SignatureSchemeComponent(
+        ("ed25519",),
+        "EdDSA over edwards25519, as specified in RFC 8032 (PureEdDSA, no context, no "
+        "pre-hash). Private key: 32 uniformly random bytes. Public key: the 32-byte "
+        "compressed encoding of the corresponding curve point, lowercase hex. "
+        "Signature: the 64 bytes R || S of RFC 8032 section 5.1.6, lowercase hex, "
+        "verified by the procedure in section 5.1.7. Message: the payload bytes, "
+        "signed as given -- the algorithm hashes internally, so nothing pre-hashes "
+        "them here.",
+        component_formal({
+            "algorithm": "eddsa",
+            "curve": "edwards25519",
+            "variant": "pure",
+            "context": "none",
+            "prehash": "none",
+            "message": "as-given",
+            "private_key_bytes": "32",
+            "public_key_bytes": "32",
+            "public_key_encoding": "hex-lowercase",
+            "signature_bytes": "64",
+            "signature_layout": "R||S",
+            "signature_encoding": "hex-lowercase",
+            "spec": "RFC8032",
+            "verification": "RFC8032-5.1.7",
+        }),
+    ),
+)
+
+# Comparing two schemes is a search for a one-to-one pairing between their components
+# (see :func:`same_signature_scheme`), which is factorial in a number a *peer* chooses.
+# The length check there means the only comparison this node actually runs is against
+# its own single-component scheme, so the search is bounded today -- but the function is
+# a general ``(scheme_a, scheme_b) -> bool``, and nothing stops a later caller from
+# handing it two peer schemes. Five leaves room for a scheme with one more building
+# block than ours at 120 pairings; twelve would be 479 million, so past the cap a
+# scheme is refused rather than computed. Configurable because the ceiling is a policy
+# about what this node is willing to spend, not a fact about cryptography.
+MAX_SIGNATURE_SCHEME_COMPONENTS_KEY: Final[str] = (
+    "communication.MAX_SIGNATURE_SCHEME_COMPONENTS"
+)
+DEFAULT_MAX_SIGNATURE_SCHEME_COMPONENTS: Final[int] = 5
+
+
+def _max_signature_scheme_components() -> int:
+    """The configured cap, read per call rather than captured at import.
+
+    Anything unreadable falls back to the default, deliberately catching everything:
+    this is a safety bound consulted from the peer-registration path, and a node with
+    no config file yet (or a malformed one) must fail to *read the cap*, not fail to
+    decide whether it speaks a peer's scheme. A non-positive value falls back too --
+    a cap of zero would refuse every scheme, including this node's own.
+    """
+    try:
+        configured = int(ConfigManager().get(
+            MAX_SIGNATURE_SCHEME_COMPONENTS_KEY, DEFAULT_MAX_SIGNATURE_SCHEME_COMPONENTS
+        ))
+    except Exception:
+        return DEFAULT_MAX_SIGNATURE_SCHEME_COMPONENTS
+    return configured if configured > 0 else DEFAULT_MAX_SIGNATURE_SCHEME_COMPONENTS
+
+
+def node_signature_scheme():
+    """This node's own scheme descriptor, as a fresh ``Peer.SignatureScheme``.
+
+    Built per call rather than kept as a module constant so no caller can mutate the
+    node's own declaration through the object it was handed.
+    """
+    scheme = celaut_pb2.Peer.SignatureScheme()
+    for component in SIGNATURE_SCHEME_COMPONENTS:
+        scheme.components.add(
+            tags=list(component.tags), prose=component.prose, formal=component.formal
+        )
+    return scheme
+
+
+def declare_signature_scheme(peer, *, prose: bool = True) -> None:
+    """Declare on ``peer`` which cryptography its ``public_key``/``signature`` are in.
+
+    Called wherever this node signs an announcement: on the wire it is what lets a
+    reader that speaks something else say so, instead of reporting a peer whose
+    signature simply "does not verify".
+
+    ``prose=False`` leaves out every component's description, which costs nothing
+    over a gRPC response but is a kilobyte of an Ergo register a box pays storage
+    rent on forever -- the whole budget, on its own (see
+    ``tests/reputation_system/test_onchain_peer_object.py``). The tags stay: while
+    ``formal`` is empty they are the whole machine-readable half of each component,
+    and dropping them would leave a descriptor that says nothing.
+    """
+    peer.signature_scheme.CopyFrom(node_signature_scheme())
+    if not prose:
+        for component in peer.signature_scheme.components:
+            component.ClearField("prose")
+
+
+def _component_is_declared(component) -> bool:
+    """Whether a component names what it is at all.
+
+    ``tags`` or ``formal``; either alone is enough, and a component carrying both is
+    better still. Neither is not a building block this node can reason about: ``prose``
+    is human text it has no way to judge, so a component holding only prose -- or
+    nothing -- states nothing a comparison could act on. Something is missing from it,
+    and the conservative answer to "is this the cryptography I speak?" is no.
+
+    It also keeps the relation reflexive: with no tags and no formal, a component would
+    otherwise fail to match a byte-identical copy of itself.
+    """
+    return bool(component.tags) or bool(bytes(component.formal))
+
+
+def same_component(a, b) -> bool:
+    """Whether two tags/prose/formal descriptors name the same thing.
+
+    Public because it is not only a step inside :func:`same_component_stack`: a
+    ``Service.Network`` is one such descriptor rather than a stack of them, so
+    ``networks.match_networks`` compares a single pair directly. Anything carrying
+    ``tags`` and ``formal`` can be passed -- a ``SignatureScheme.Protocol``, a
+    ``Uri.Protocol``, a ``Contract.Ledger``, a ``Service.Network`` -- which is what
+    declaring every replaceable component in the same shape is for.
+
+    ``formal`` decides whenever **both** sides declare one, as the strictest and most
+    machine-readable identity: two components pointing at different specifications name
+    different things however their tags read, which is what makes the field worth
+    declaring at all.
+
+    Otherwise the tags decide, and there **one shared tag is enough**. The tags of a
+    component are alternative names for the single thing it names, so two components
+    that agree on any one of them have named the same thing twice: ``["tls", "tls1.3"]``
+    and ``["tls1.3", "tls-1.3"]`` are one protocol under two vocabularies, and demanding
+    the whole set match would refuse a peer for spelling it differently or for listing
+    one synonym more. The looseness is deliberate -- these descriptors are loose by
+    design (see ``Peer.SignatureScheme`` in celaut.proto), and where a shared generic
+    tag would be too weak to conclude from, ``formal`` is how a component says so
+    precisely.
+
+    Being an intersection, the relation is reflexive and symmetric but **not
+    transitive**: ``[a,b]`` matches ``[b,c]`` matches ``[c,d]``, and the ends do not
+    match. Nothing here treats "the same component" as an equivalence class, and a
+    caller that wants to group by it cannot rely on this to partition anything.
+
+    A component declaring only ``formal`` against one declaring only tags shares
+    nothing to compare and does not match: what each states is a thing the other never
+    mentions.
+
+    ``prose`` is not compared at all: it is human text this node has no way to judge,
+    and making it decisive would refuse a peer for rewording a sentence.
+    """
+    formal_a, formal_b = bytes(a.formal), bytes(b.formal)
+    if formal_a and formal_b:
+        return formal_a == formal_b
+    return bool(set(a.tags) & set(b.tags))
+
+
+def same_declaration(a, b) -> bool:
+    """Whether two components declare the very same thing, in full.
+
+    The strict form of :func:`same_component`, for the places where the whole
+    declaration is what has to agree -- a ledger a node pays into or reads proofs
+    from. There a tag cannot stand in: a tag-only ``ergo`` ledger says nothing about
+    the network, the units or how a deposit is bound, so a peer that declares only
+    tags has not said what this node needs to check. Both sides must therefore carry
+    a non-empty ``formal``, and those bytes must be equal. A layer of the transport
+    stack also needs a non-empty ``formal``, but it is compared by protobuf's rules
+    (``transport_stack.compatible_layers``), not byte for byte.
+
+    ``same_component``'s tag fallback stays for descriptors that are loose by design
+    (signature-scheme building blocks, a URI's transport, network slots).
+    """
+    formal_a, formal_b = bytes(a.formal), bytes(b.formal)
+    return bool(formal_a) and bool(formal_b) and formal_a == formal_b
+
+
+def same_signature_scheme(a, b) -> bool:
+    """Whether two scheme descriptors denote the same cryptography.
+
+    The comparison a node makes on its own, and the one place a
+    ``(scheme_a, scheme_b) -> bool`` equivalence service would be called from instead
+    -- deciding that two differently-worded descriptors mean the same scheme is
+    exactly the judgement such a service exists to make, and until one is asked this
+    node has to answer conservatively.
+
+    A scheme is an unordered stack of components (see ``Peer.SignatureScheme`` in
+    celaut.proto), so this asks for a one-to-one pairing between the two schemes'
+    components, not a positional comparison. Within a pair, matching is
+    :func:`same_component`'s (``formal`` when both sides carry one, a shared tag
+    otherwise); across the whole scheme, the pairing must be total. A peer declaring an
+    extra component, or missing one, is a different scheme even if every paired
+    component matches: a shared tag is enough to identify one *building block*, never
+    to conclude anything about a scheme built from a different number of them, and a
+    stack that names one thing this node's does not is a stack it does not speak.
+
+    Three things are refused before the pairing is searched for, each of them a "no"
+    in its own right rather than an optimization:
+
+    * **Different cardinality.** Nothing to pair; see above.
+    * **More components than the configured cap**
+      (``communication.MAX_SIGNATURE_SCHEME_COMPONENTS``). The search is factorial in
+      a length a peer chooses. Today the only comparison this node runs is against its
+      own single-component scheme, so the cardinality check already bounds it -- the cap
+      is what keeps that true if this ever compares two peers' schemes to each other.
+    * **A component that declares neither tags nor formal** on either side; see
+      :func:`_component_is_declared`.
+    """
+    return same_component_stack(a.components, b.components)
+
+
+def same_component_stack(a_components, b_components) -> bool:
+    """Whether two unordered stacks of tags/prose/formal descriptors denote the same thing.
+
+    The comparison itself, separated from what is being compared: celaut declares every
+    replaceable component this way -- a signature scheme, an address's protocol stack, a
+    ledger, a container architecture -- so the rule for deciding whether two of them
+    match belongs in one place rather than being restated per field. See
+    :func:`same_signature_scheme` for the reasoning behind each clause, and
+    ``src/identity/transport_stack.py`` for the other caller.
+    """
+    a_components, b_components = list(a_components), list(b_components)
+    if len(a_components) != len(b_components):
+        return False
+
+    if len(a_components) > _max_signature_scheme_components():
+        return False
+
+    if not all(_component_is_declared(c) for c in a_components + b_components):
+        return False
+
+    return any(
+        all(same_component(x, y) for x, y in zip(a_components, permutation))
+        for permutation in itertools.permutations(b_components)
+    )
+
+
+def speaks_our_signature_scheme(peer) -> bool:
+    """Whether ``peer``'s announcement is signed with the one scheme this node verifies.
+
+    The node implements no scheme negotiation and no second scheme: this is the whole
+    of its handling of ``Peer.signature_scheme``. It has to be checked *before* the
+    key and the signature are read, because what those two fields mean -- their
+    length, their encoding, the verification procedure -- is exactly what the scheme
+    decides.
+
+    A descriptor with no components is refused: an announcement that does not say
+    which cryptography it is signed in gives a verifier nothing to verify it with, and
+    every node declares its scheme.
+    """
+    return same_signature_scheme(peer.signature_scheme, node_signature_scheme())
+
+
+def normalize_public_key_hex(public_key_hex: str) -> Optional[str]:
+    """Canonical form of an announced public key, or None if it is not one.
+
+    The public key doubles as the ``peer_id``, so it must have exactly one spelling:
+    ``bytes.fromhex`` accepts uppercase and skips ASCII whitespace, which would let
+    ``"AB…"``, ``"ab…"`` and ``"a b…"`` all verify and each become a *separate* peer
+    row for one node.
+    """
+    candidate = str(public_key_hex or "").strip().lower()
+    if len(candidate) != _PUBLIC_KEY_HEX_LENGTH or not set(candidate) <= _HEX_DIGITS:
+        return None
+    return candidate
+
+
+def get_identity_mnemonic() -> Optional[str]:
+    """The mnemonic backing this node's identity keypair, or None if there is none.
+
+    There is exactly ONE identity mnemonic in a node, ``identity.MNEMONIC``, and it is
+    not any ledger's wallet. ConfigManager generates it on first load when unset, so
+    this returns None only if the config was never loaded -- and it never changes
+    underfoot, which matters because the derived public key IS this node's ``peer_id``:
+    a second source would let the node's identity silently change (and orphan its
+    deposits and reputation network-wide) the moment a wallet was added or removed.
+    """
+    mnemonic = str(ConfigManager().get(IDENTITY_MNEMONIC_KEY, "") or "").strip()
+    return mnemonic if mnemonic and mnemonic != "auto" else None
+
+
+@lru_cache(maxsize=4)
+def _cached_keypair(mnemonic: str):
+    """Memoized derivation for one mnemonic: ``(public key hex, Ed25519PrivateKey)``.
+
+    Deriving costs a PBKDF2-HMAC-SHA512 (2048 rounds), and signing a ``Peer`` would pay
+    it on every ``GetPeerInfo`` -- an unauthenticated RPC anyone can call. The identity
+    key never changes for a given mnemonic, so cache it, keyed on the mnemonic itself
+    rather than on nothing: a process only ever sees one, but a test (or the installer,
+    minting the first one) may drive this with several.
+
+    The BIP-39 seed is 64 bytes and Ed25519 wants 32, so it is hashed down rather than
+    truncated: a truncation would make this key a prefix of whatever else that seed
+    derives, while a personalised Blake2b leaves the two unrelated.
+    """
+    mnemo = Mnemonic("english")
+    if not mnemo.check(mnemonic):
+        raise ValueError("Invalid mnemonic phrase.")
+    digest = hashes.Hash(hashes.BLAKE2b(64))
+    digest.update(_SEED_PERSONALISATION + mnemo.to_seed(mnemonic, passphrase=""))
+    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(digest.finalize()[:32])
+    public_key_hex = private_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    ).hex()
+    return public_key_hex, private_key
+
+
+def get_node_public_key_hex() -> Optional[str]:
+    """This node's identity public key, as the 32-byte raw Ed25519 key in hex."""
+    mnemonic = get_identity_mnemonic()
+    if not mnemonic:
+        return None
+    return _cached_keypair(mnemonic)[0]
+
+
+def _canonical_contract_message(contract) -> str:
+    """Deterministic encoding of one ``Contract`` (a ledger plus its xattrs)."""
+    xattrs = ";".join(
+        f"{key}={bytes(value).hex()}" for key, value in keyvalue.items(contract.xattrs)
+    )
+    return "~".join([
+        contract.ledger.formal.hex(),
+        ",".join(sorted(contract.ledger.tags)),
+        contract.ledger.prose,
+        xattrs,
+    ])
+
+
+def _canonical_contract(contract_rate) -> str:
+    """Deterministic encoding of one advertised payment contract and its rate."""
+    return "~".join([
+        _canonical_contract_message(contract_rate.contract),
+        contract_rate.mu_per_unit.n,
+    ])
+
+
+def _canonical_protocol(protocol) -> str:
+    """Deterministic encoding of one ``Peer.Uri.Protocol``."""
+    return "~".join([
+        protocol.formal.hex(),
+        ",".join(sorted(protocol.tags)),
+        protocol.prose,
+    ])
+
+
+def _canonical_uri(uri) -> str:
+    """Deterministic encoding of one advertised address and everything it declares."""
+    protocol_stack = ";".join(sorted(_canonical_protocol(p) for p in uri.protocol_stack))
+    return "~".join([
+        uri.ip,
+        str(uri.port),
+        str(uri.expiry_unix_timestamp),
+        _canonical_protocol(uri.transport),
+        protocol_stack,
+    ])
+
+
+def _canonical_sysresources(sysresources) -> str:
+    """Deterministic encoding of one ``Sysresources``.
+
+    Presence is part of it: every scalar here is ``optional``, and an unset limit
+    ("nothing said") is not the same claim as a limit of 0. ``benchmark`` is sorted
+    by key, like every key/value list in the digest.
+    """
+    scalars = ",".join(
+        f"{name}={getattr(sysresources, name)}" if sysresources.HasField(name) else f"{name}="
+        for name in ("blkio_weight", "cpu_period", "cpu_quota", "mem_limit", "disk_space")
+    )
+    benchmark = ";".join(sorted(
+        f"{entry.key}={entry.value if entry.HasField('value') else ''}"
+        for entry in sysresources.benchmark
+    ))
+    return "~".join([scalars, benchmark])
+
+
+def _canonical_architecture_resources(entry) -> str:
+    """Deterministic encoding of one announced ``ArchitectureResources``."""
+    return "~".join([
+        _canonical_protocol(entry.architecture),
+        _canonical_sysresources(entry.resources) if entry.HasField("resources") else "-",
+    ])
+
+
+def _canonical_device(entry) -> str:
+    """Deterministic encoding of one announced ``Device`` (#536).
+
+    The ``Resources`` pair keeps the presence of each half: an absent ``at_init`` is not
+    an empty one.
+    """
+    halves = "~".join(
+        _canonical_sysresources(half) if entry.resources.HasField(name) else "-"
+        for name, half in (
+            ("at_init", entry.resources.at_init),
+            ("at_most", entry.resources.at_most),
+        )
+    )
+    return "~".join([
+        _canonical_protocol(entry.architecture),
+        halves if entry.HasField("resources") else "-",
+        ",".join(str(int(m)) for m in sorted(entry.attach)),
+    ])
+
+
+def canonical_peer_content_digest(peer) -> str:
+    """A stable digest of everything a peer advertises about itself.
+
+    The signature has to cover the *whole* advertisement, not just the addresses:
+    ``payment_contracts`` is what decides where this node's money is sent, and
+    ``mu_per_call`` carries the advertised rates. Leaving them unsigned let
+    anyone take a legitimately signed ``Peer``, swap in their own payment contract,
+    and have it accepted and stored (``add_contract`` is INSERT OR IGNORE, so the
+    forged contract lands *next to* the real one rather than replacing it). Each
+    URI's own ``expiry_unix_timestamp`` and ``transport`` are included too, so
+    neither can be stripped (making a soon-to-expire address look permanent, or a
+    UDP endpoint look like a TCP one) nor extended in transit.
+
+    ``reputation_proofs`` is covered as well. The proofs are validated against the
+    peer's own id before being stored, so a forged one cannot enter the database --
+    but the message is kept verbatim and republished on-chain, where a reader is told
+    the signature vouches for it. Leaving them out would let a relay graft proofs onto
+    (or strip them from) a claim that still verifies.
+
+    An owner attestation rides inside the proof it belongs to, as two of that
+    ``Contract``'s xattrs, so it is covered by ``reputation_proofs`` above with nothing
+    further to account for here. Each one carries its own signature by the wallet it
+    names, so a forged entry cannot survive :func:`attested_proof_owner` -- but a relay
+    could still strip one, and a peer whose attestation went missing loses the
+    reputation it can prove, which covering the proofs is what prevents.
+
+    Built field by field rather than from ``SerializeToString()``, which protobuf does
+    not guarantee to be canonical (field order, unknown fields, non-minimal varints).
+    Every repeated element is sorted so the digest does not depend on the order a node
+    happened to enumerate things in.
+
+    The price of that choice is that "covers everything" is a property of this code
+    rather than of the encoding, so it is asserted:
+    ``tests/test_peer_content_digest_covers_every_field.py`` censuses every field of
+    every message named below and fails on one that is neither covered here nor
+    declared excluded, and it also checks that each covered field genuinely moves the
+    digest. A field left out would be one a relay can rewrite under a signature that
+    still verifies -- and, because ``gateway.utils`` caches on this digest, one whose
+    fresh value is replaced by the cached announcement (issue #330).
+
+    ``resources`` (#459) is covered too: it is what a peer reads to decide whether to
+    call this node at all, so a relay able to rewrite it could make a node invisible
+    for an architecture it serves, or advertise a benchmark score it never measured.
+    Every field of every ``Sysresources`` is encoded with its presence, since an
+    unset limit and a limit of 0 are different claims.
+
+    ``signature_scheme`` is covered as well, which it has to be as soon as more than one
+    scheme can be accepted: a relay that could re-label a signature as belonging to a
+    different scheme -- one whose verification also accepts those bytes, or simply a
+    weaker one -- would be re-labelling an authentication decision. Which schemes a node
+    accepts is a local capability (see :func:`same_signature_scheme`), so nothing stops
+    one from plugging in a second verifier, and the digest must not be the thing that
+    has to change when it does.
+    """
+    uris = sorted(_canonical_uri(uri) for uri in peer.uri)
+    contracts = sorted(_canonical_contract(gp) for gp in peer.payment_contracts)
+    proofs = sorted(_canonical_contract_message(c) for c in peer.reputation_proofs)
+    scheme = ";".join(
+        sorted(_canonical_protocol(c) for c in peer.signature_scheme.components)
+    )
+    rates = ";".join(
+        f"{key}={amount.n}" for key, amount in keyvalue.items(peer.mu_per_call)
+    )
+    resources = sorted(_canonical_architecture_resources(r) for r in peer.resources)
+    # `devices` (#536): the same encoding. An entry repeated is a device repeated, so
+    # the count of an architecture is part of what the signature covers.
+    devices = sorted(_canonical_device(r) for r in peer.devices)
+    # `activity_window` (#344): an absent message ("no schedule") and an empty one
+    # ("always open") are different claims, so presence is part of the encoding.
+    if peer.HasField("activity_window"):
+        window = peer.activity_window
+        spans = ",".join(sorted(f"{s.start_minute}-{s.end_minute}" for s in window.spans))
+        activity_window = f"w:{int(window.on_close)}:{spans}"
+    else:
+        activity_window = "-"
+
+    canonical = "|".join([
+        "/".join(uris),
+        "/".join(contracts),
+        "/".join(proofs),
+        rates,
+        scheme,
+        "/".join(resources),
+        activity_window,
+        "/".join(devices),
+    ])
+    # Blake2b-256. Nothing outside this function reads the value -- a verifier
+    # recomputes it from the peer's own advertisement, and it is never stored or
+    # transmitted -- so what matters is only that both sides derive it the same way.
+    return hashlib.blake2b(
+        canonical.encode("utf-8"), digest_size=32
+    ).hexdigest()
+
+
+def canonical_peer_payload(public_key_hex: str, ts: int, content_digest: str) -> str:
+    """
+    The exact string a ``Peer`` signature is computed over.
+
+    ``content_digest`` comes from :func:`canonical_peer_content_digest`, so the
+    signature covers every advertised address (with its expiry and transport), the
+    payment contracts and the rates at once, and any field added later is covered as
+    soon as the digest accounts for it.
+    """
+    return f"{public_key_hex}|{ts}|{content_digest}"
+
+
+def sign_peer_payload(payload: str) -> Optional[str]:
+    """Sign ``payload`` with this node's identity key, or None if none is configured."""
+    mnemonic = get_identity_mnemonic()
+    if not mnemonic:
+        return None
+    return _cached_keypair(mnemonic)[1].sign(payload.encode("utf-8")).hex()
+
+
+def verify_peer_payload(public_key_hex: str, payload: str, signature_hex: str) -> bool:
+    """Verify ``signature_hex`` over ``payload`` was produced by ``public_key_hex``.
+
+    Rejects any public key that is not already in canonical form, so a caller cannot
+    end up storing a non-canonical spelling as a ``peer_id``.
+    """
+    if normalize_public_key_hex(public_key_hex) != public_key_hex or not signature_hex:
+        return False
+    try:
+        public_key = ed25519.Ed25519PublicKey.from_public_bytes(
+            bytes.fromhex(public_key_hex)
+        )
+        public_key.verify(bytes.fromhex(signature_hex), payload.encode("utf-8"))
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+    return True
+
+
+def attestation_payload(peer_id: str) -> str:
+    """The exact string a ledger wallet signs to vouch for ``peer_id``.
+
+    Prefixed so the signature cannot be lifted into any other context that wallet signs
+    -- a reputation payload, an IOU note -- nor one of those replayed as an attestation.
+    The peer_id alone would be 64 hex characters, which is also the shape of plenty of
+    other things an Ergo key is asked to sign.
+    """
+    return _ATTESTATION_PREFIX + peer_id
+
+
+def statement_payload(peer_id: str, statement_digest: str) -> str:
+    """The exact string a node signs to vouch for a balance statement (#570).
+
+    ``statement_digest`` is ``balance_statement.statement_digest``, which covers every
+    field of the statement. Prefixed, as a receipt is (docs/EXECUTION_RECEIPTS.md), so
+    that this signature cannot be read as any other thing that the key signs.
+    """
+    return f"{_STATEMENT_PREFIX}{peer_id}|{statement_digest}"
+
+
+def receipt_payload(peer_id: str, receipt_digest: str) -> str:
+    """The exact string a node signs to vouch for an execution receipt (#419).
+
+    ``receipt_digest`` is ``execution_receipt.receipt_digest``, which covers every field
+    of the receipt but the salt of its envs and the signature. The same shape as
+    :func:`statement_payload`, with a prefix of its own.
+    """
+    return f"{_RECEIPT_PREFIX}{peer_id}|{receipt_digest}"
+
+
+def client_binding_payload(peer_id: str, client_id: str) -> str:
+    """The exact string a peer signs to claim ``client_id`` as its own on ``GenerateClient``.
+
+    Both are bound together so the signature cannot be lifted onto a different
+    client_id this peer did not just request, nor claimed by a different peer for
+    this one. No timestamp: ``client_id`` is single-use by construction
+    (``sc.client_exists`` already refuses to mint the same one twice), so there is
+    nothing here a replay could achieve that requesting it fresh could not.
+    """
+    return f"{_CLIENT_BINDING_PREFIX}{peer_id}|{client_id}"
+
+

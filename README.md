@@ -9,19 +9,19 @@ packed service as a single **`.celaut.bee`** file.
 It is a thin wrapper around the *real* packer worker
 (`src/packers/zip_with_dockerfile.py`), **shipped in-repo** under
 [`src/`](src/) — not a re-implementation — so the `service_id`
-it emits is byte-identical to `nodo pack`. That tree is the exact
-transitive import closure of the packer worker (packer + `src.utils` /
-`src.manager.resources` + the `protos/` package); the image no longer clones
-nodo at build time, so this service is self-contained and unaffected when nodo
-drops its local Docker packer.
+it emits is byte-identical to `nodo pack`. That tree is the import closure of the
+packer worker of nodo's **`dev`** branch (the packer, its `service_json`,
+`src.utils`, `src.identity`, `src.manager` modules and the `protos/` package); the
+image does not clone nodo at build time, so this service is self-contained. Like
+nodo's own packer it builds with a **BuildKit** daemon driven by `buildctl` (no
+Docker engine inside the VM). The project layout it accepts is the one of nodo's
+[`docs/PACKING.md`](https://github.com/celaut-project/nodo/blob/dev/docs/PACKING.md).
 
-Since **v0.2.0** the same microVM also serves a **browser VS Code** on `:8443`
-(see [Browser IDE](#browser-ide-code-server)) so users can pick a language
-template, edit, and pack a service end-to-end without any local toolchain.
+A browser IDE (code-server) used to live in this repo; it is a separate project now, and it can use this packer as a dependency.
 
 ## API
 
-Bound on `0.0.0.0:8080` (declared in `<arch>/.service/service.json`).
+Bound on `0.0.0.0:8080` (the only api slot, declared in `<arch>/.service/service.json`).
 
 | Method | Path      | Body                | Response |
 |--------|-----------|---------------------|----------|
@@ -34,27 +34,39 @@ Errors: `415` (not a zip), `400` (config or packing error), `413` (too large),
 **Config validation:** before building, the `.service` configuration is checked
 and any problems are returned as a numbered, plain-English list (invalid JSON
 with line/column, missing/wrong `architecture`, no entrypoint, malformed `api`
-slots, the `dependencies_env`+array trap, …) pointing at `SERVICE_CONFIG_GUIDE.md`.
+slots, the `dependencies_env`+array trap, …) pointing at nodo's [`docs/PACKING.md`](https://github.com/celaut-project/nodo/blob/dev/docs/PACKING.md).
 A bad config gets an actionable message instead of a cryptic Docker build
 failure. Example body:
 
 ```
 Your .service configuration has 2 problems:
 
-  1. "architecture" is required in service.json. Add "architecture": "linux/amd64". (SERVICE_CONFIG_GUIDE.md → architecture)
+  1. "architecture" is required in service.json. Add "architecture": "linux/amd64". (docs/PACKING.md → architecture)
   2. no entrypoint declared — the service has nothing to run. Add "init": { "entry_path": ["app", "start.sh"] } ...
 
-Fix and re-pack. Full field reference: SERVICE_CONFIG_GUIDE.md.
+Fix and re-pack. Full field reference: docs/PACKING.md of nodo (URL).
 ```
 
-The zip must contain, at its root **or** inside a single top-level folder:
-`Dockerfile`, `service.json`, and optionally `pack_config.json`.
+The zip is either the `.service.zip` that `nodo pack` sends, or a project zipped as
+it is. A project must contain, at its root **or** inside a single top-level folder,
+its configuration at the root (`Dockerfile`, `service.json`, optionally
+`pack_config.json`) or in a `.service/` folder (the recommended layout). The server
+prepares it as nodo does before it builds: the project files go under `service/`,
+the `./` sources of the `COPY` lines are rewritten to `service/...`, and
+`include`, `ignore` and `.dockerignore` choose the files.
+
+**Dependencies.** `nodo pack` puts local and git dependencies in the zip. It uploads a
+dependency that is in its registry with `GET`/`POST /registry/<id>` (the
+bundle: `service`, `metadata`, `blocks/<id>`), so this server keeps those two
+endpoints. A packed service is a multiblock directory, or one file when it has no blocks.
 
 ### Example
 
 ```bash
-# zip a project (the same layout nodo pack expects)
-( cd examples/hello && zip -r - . ) > /tmp/hello.zip
+# zip a project (the same layout nodo pack expects). examples/hello has one pack
+# root for each architecture; use the one of the packer instance (or the other:
+# the packer emulates it with qemu).
+( cd examples/hello/amd64 && zip -qr - . ) > /tmp/hello.zip
 
 # pack it via the running service
 curl -sS -X POST --data-binary @/tmp/hello.zip \
@@ -71,21 +83,31 @@ grep -i x-service-id /tmp/headers.txt   # the content-addressed id
 POST /pack (zip)
    │
    ▼
-server.py  ── unzip, validate (service.json + Dockerfile) ──┐
-   │                                                        │
-   ▼                                                        │
-nodo worker:  python -m src.packers.zip_with_dockerfile     │  in-VM dockerd
-   │  docker buildx build --output type=tar  ───────────────┘  (docker-in-docker)
+server.py  ── unzip, validate service.json, prepare the context ──┐
+   │                                                              │
+   ▼                                                              │
+nodo worker:  python -m src.packers.zip_with_dockerfile           │  in-VM buildkitd
+   │  buildctl build --output type=tar  ──────────────────────────┘  (host network)
    │  → export rootfs → walk fs → build celaut.Service protobuf
    │  → multiblock dir + content hash = service_id
    ▼
 bee_rpc.read_multiblock_directory(service_dir) → bytes  →  <id>.celaut.bee
 ```
 
-`start.sh` boots an in-VM Docker daemon (DinD) and a host-network `buildx`
-builder, then runs `server.py`. **This is why the service declares
-`network: tag=(*)`** — buildx must reach arbitrary container registries to pull
-the base images referenced by the Dockerfile being packed.
+`start.sh` starts a `buildkitd` in the guest (overlayfs, with the native
+snapshotter as a fallback) on the socket where nodo's packer looks for it
+(`/opt/nodo/buildkit/buildkitd.sock`), registers the qemu handler of the other
+architecture, starts the HTTP server, and then reads the notices of
+the node on `/dev/hvc0`: on `STOP` or `HIBERNATE` it stops the server and BuildKit and
+exits at once, so the node does not wait (`notice_declaration` is the default one in
+`service.json`). **This is why the service declares `network: tag=(*)`** —
+BuildKit must reach arbitrary container registries to pull the base images
+referenced by the Dockerfile being packed.
+
+The service declares `uses_gateway`: it asks its own node, through the gateway, for
+more RAM when a pack needs it (`src/manager/resources.py`, with the
+`node_controller` library, in a child process because the library and nodo's
+`protos/` each register their own `celaut.proto`).
 
 ### Packing the packer: one pack root per architecture
 
@@ -95,66 +117,33 @@ The packer itself is released for both architectures, with the layout of
 ```
 amd64/  arm64/           pack roots: nodo pack amd64 | nodo pack arm64
 ├── .service/            Dockerfile, service.json, pack_config.json, .dockerignore (real files)
-└── src ide server.py start.sh  -> symlinks to the shared sources at the root
+└── src server.py start.sh  -> symlinks to the shared sources at the root
 ```
 
 `nodo pack <dir>` reads only `<dir>/.service/`, copies `<dir>` following symlinks and takes
 the architecture from its `service.json`. The two `.service/` differ only in
-`"architecture"` (the Dockerfile pins multi-arch images). `tests/test_layout.py` checks the
-shape. Pack the root of the architecture of the node (`nodo pack` on an arm64 node cannot
-build `amd64`); an instance packs services of **its own architecture**: on an arm64 host,
-the packer answers 400 to a `linux/amd64` project ("cross-architecture builds are disabled").
+`"architecture"` (the Dockerfile pins every base image by the digest of its multi-arch
+index, and its first lines say which variant it is). `examples/hello` has the same
+layout.
 
 ### Multi-arch (amd64 + arm64 via qemu)
 
-The packer runs on an **amd64 host**, but it can pack services for **both
-`linux/amd64` and `linux/arm64`**. After the in-VM dockerd is up, `start.sh`
-registers qemu `binfmt_misc` handlers (`tonistiigi/binfmt --install arm64`,
-pulled over the `tag=(*)` egress) so `buildx` can build arm64 images under
-emulation. The target architecture is taken from each service's
-`service.json` `"architecture"` field; supported values are configured via
-`PACKER_ARCHES` (default `linux/amd64,linux/arm64`) and qemu registration can be
-disabled with `PACKER_ENABLE_QEMU=0`.
+An instance packs services for **both `linux/amd64` and `linux/arm64`**. It builds its
+own architecture natively. For the other one, `start.sh` registers the qemu
+`binfmt_misc` handler (`binfmt --install`, from the pinned `tonistiigi/binfmt`
+stage of the Dockerfile) so BuildKit can run the `RUN` lines under emulation;
+`src/utils/arch_guard.py` (from nodo) checks that the handler is enabled before a
+foreign build starts, and refuses it with the name of the missing handler if not. The
+target architecture is taken from each service's `service.json` `"architecture"`
+field; supported values are configured with `PACKER_ARCHES` (default
+`linux/amd64,linux/arm64`) and qemu registration can be disabled with
+`PACKER_ENABLE_QEMU=0`.
 
-Crucially, **arm-via-qemu builds stay deterministic**: the content-addressed
-`service_id` is byte-identical across repeated packs of the same arm64 input, so
-emulation does not weaken the packing contract.
-
-## Browser IDE (code-server)
-
-The image also installs **code-server** (VS Code in the browser), served on the
-second api slot `:8443`. `start.sh` seeds a `/workspace` and launches it
-(`--auth none`; access is mediated by the nodo network/DNAT layer) before
-handing the foreground to the packer server.
-
-The workspace ships everything needed to build a Celaut service:
-
-- **`START_HERE.md`** — the landing guide.
-- **`SERVICE_CONFIG_GUIDE.md`** — the full upstream configuration reference
-  ([zip_with_dockerfile README](https://github.com/celaut-project/nodo/blob/stable/src/commands/packer/zip_with_dockerfile/README.md)),
-  always bundled at the workspace root and inside every service you create.
-- **`templates/<lang>/`** — 8 preconfigured language templates, each with a
-  ready `.service` config (`Dockerfile` + `service.json` + `pack_config.json`),
-  a `start.sh`, and minimal buildable source:
-  `python`, `go`, `rust`, `node-express`, `node-typescript`, `java-spring`,
-  `java-gradle`, `php-laravel`.
-- **`.vscode/tasks.json`** — a *New service from template* task that pops a
-  language picker, plus a *Pack this service* task.
-
-Two helper CLIs are on `PATH` in the IDE terminal:
-
-| Command | What |
-|---|---|
-| `new-service <lang> [name]` | Scaffold a template into the workspace (and drop the config guide inside it). |
-| `pack-service [dir]` | Zip a project and `POST` it to the local packer (`:8080`), saving `<service-id>.celaut.bee` next to it. |
-
-So the full loop — **pick a template → edit → pack → get a `.celaut.bee`** —
-happens inside one sealed microVM.
+## Ports
 
 | Port | Service |
 |---|---|
-| `8080` | Packer HTTP API (`/health`, `/pack`) |
-| `8443` | code-server (browser VS Code) |
+| `8080` | Packer HTTP API (`/health`, `/pack`, `/registry/<id>`) |
 
 ## Bootstrap / dogfood test
 
@@ -170,37 +159,48 @@ The acceptance test from the brief is a two-step bootstrap:
 
 ## Validation status
 
-Verified end-to-end on an amd64 + KVM host, running the packer as a privileged
-Docker-in-Docker container:
+Checked with the image built for `linux/arm64` and run as a privileged container (the
+guest of the microVM is not available in CI):
 
-- **amd64 dogfood — node == service.** `nodo pack examples/hello` and the
-  service's `POST /pack` produce the **same** `service_id`
-  (`8eff6cd8…a79d26c7`), deterministically on both legs.
-- **arm64 via qemu — deterministic.** With qemu `binfmt` registered, the same
-  `linux/arm64` project packed repeatedly yields a **byte-identical**
-  `service_id` (`8783b238…2d0e65be`) and identical `.bee` size each run —
-  emulation does not introduce non-determinism.
+- **BuildKit path.** `POST /pack` of `examples/hello/arm64` gives `200` with an
+  `X-Service-Id`, and a second pack of the same input gives the **same** id.
+- **Same id as `nodo pack`.** That id (`24e26750…`) is the one that `nodo pack
+  examples/hello/arm64` gives (the installed nodo, commit `76dcac3b`). Without the `/sys`
+  rule below it was not: the rootful BuildKit of this service exports the build time for
+  `/sys`, and nodo's rootless one leaves 0. The two tars of `examples/hello` have 522
+  entries and are the same except for `/sys`.
+- **Cross-architecture.** `examples/hello/amd64`, packed on the arm64 instance, builds
+  under the qemu handler that `start.sh` registers.
+- **Configuration errors.** A `service.json` with a wrong `read_only_filesystem`, both
+  `protocol` and `protocol_stack`, and a `network` entry without `prose` gets a numbered
+  list of problems and not a build failure.
+- **Registry endpoints.** `POST` then `GET /registry/<id>` of a one-file service, and a
+  second `POST`, answer as documented.
 
-Determinism depends on two upstream-nodo fixes that are **baked into the
-packer source** under `src/` (search for `DETERMINISM PATCH`);
-without them packing is non-reproducible. The Dockerfile asserts both are
-present so a regression fails the build:
+Not checked here: other projects than `examples/hello` against `nodo pack`, the amd64
+id against a `nodo pack` on an amd64 node, and a boot inside a cloud-hypervisor microVM (overlayfs, `/dev/hvc0` notices, hotplugged RAM).
+
+The id depends on three fixes that are **baked into the packer source** under `src/`
+(search for `DETERMINISM PATCH`); the Dockerfile asserts both are present so a regression
+fails the build:
 
 1. **sorted directory walk** — `recursive_parsing` iterates `os.listdir()`
    sorted, so branch order is stable across extractions.
-2. **zeroed symlink mtime** — `filesystem_xattrs.metadata_from_lstat` hashes
-   `mtime_ns = 0`; `tarfile` otherwise reassigns symlink mtimes to wall-clock on
-   every extract.
+2. **zeroed symlink mtime** — `filesystem_xattrs` hashes `mtime_ns = 0` for a
+   symlink; `tarfile` otherwise reassigns symlink mtimes to wall-clock on every
+   extract. (nodo has this one upstream now.)
+
+3. **`/sys` at epoch 0** (`BUILDER_MOUNT_POINTS_AT_EPOCH`) — see above. This service runs
+   BuildKit as root; nodo's builder is rootless.
 
 protobuf must be the **pure-python** implementation on both legs (the `upb`
 C backend has unstable map ordering across runs).
 
-### Notes & remaining work
+### Notes
 
-- **Execution target.** The proven path runs the packer as a privileged DinD
-  container. Running it inside a sealed cloud-hypervisor microVM additionally
-  requires the runtime to allow a nested Docker daemon (privileged / overlay /
-  netfilter) and egress for `buildx` to pull base images.
-- **Open cross-check.** arm64 is proven *service-self-deterministic* (repeat
-  packs match); the node-side `nodo pack` arm64 == service cross-check is still
-  to be closed (register qemu on the host docker, then compare to `8783b238…`).
+- **Execution target.** Running it inside a sealed cloud-hypervisor microVM needs a
+  guest kernel with overlayfs (or the native snapshotter is used), `binfmt_misc`, and
+  egress for BuildKit to pull base images.
+- The size above which a file is stored as a block
+  (`packer.MIN_BUFFER_BLOCK_SIZE`, `MIN_BUFFER_BLOCK_SIZE` here, 32 KiB) does not
+  change the service id in nodo `dev`; it only moves memory to disk.

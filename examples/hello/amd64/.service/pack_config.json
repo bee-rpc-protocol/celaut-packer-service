@@ -1,0 +1,10 @@
+{
+    "include": [
+        "src",
+        "Cargo.toml"
+    ],
+    "ignore": [
+        "target/",
+        "*.bee"
+    ]
+}

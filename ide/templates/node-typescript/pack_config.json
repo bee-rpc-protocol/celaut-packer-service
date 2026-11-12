@@ -1,4 +1,0 @@
-{
-    "include": ["src", "package.json", "package-lock.json", "tsconfig.json", "start.sh", ".service/pack_config.json"],
-    "ignore": ["node_modules/", "dist/", "**/*.test.ts", "*.md", ".env", "coverage/"]
-}

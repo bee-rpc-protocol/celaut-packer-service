@@ -1,40 +1,35 @@
-import hashlib
-from typing import Generator, List
+from typing import Generator, List, Optional
 
-from src.utils.hashing import SHA3_256_ID, SHA3_256, SHAKE_256_ID, SHAKE_256, get_configured_hash_id
+from src.utils.hashing import (
+    BLAKE2B_ID,
+    HASH_SPECS,
+    SHA3_256_ID,
+    SHAKE_256_ID,
+    get_configured_hash_id,
+    hash_stream_many,
+)
 from protos.celaut_pb2 import Metadata
+
+# Every algorithm a packed service carries a digest for, regardless of which one
+# is configured for its main id (hashing.HASH). SHA3_256 and SHAKE_256 are the
+# two the format has always shipped; BLAKE2B joins them so a service is
+# verifiable under it too without a repack, should hashing.HASH ever be set to
+# it on some node.
+_RECORDED_HASH_IDS = (SHA3_256_ID, SHAKE_256_ID, BLAKE2B_ID)
 
 
 def calculate_hashes_by_stream(value: Generator[bytes, None, None]) -> List[Metadata.HashTag.Hash]:
-    sha3_256 = hashlib.sha3_256()
-    shake_256 = hashlib.shake_256()
-    for chunk in value:
-        sha3_256.update(chunk)
-        shake_256.update(chunk)
-
+    digests = hash_stream_many(
+        value, [HASH_SPECS[hash_id] for hash_id in _RECORDED_HASH_IDS]
+    )
     return [
-        Metadata.HashTag.Hash(
-            type=SHA3_256_ID,
-            value=sha3_256.digest()
-        ),
-        Metadata.HashTag.Hash(
-            type=SHAKE_256_ID,
-            value=shake_256.digest(32)
-        )
+        Metadata.HashTag.Hash(type=hash_id, value=digests[hash_id])
+        for hash_id in _RECORDED_HASH_IDS
     ]
 
 
 def calculate_hashes(value: bytes) -> List[Metadata.HashTag.Hash]:
-    return [
-        Metadata.HashTag.Hash(
-            type=SHA3_256_ID,
-            value=SHA3_256(value)
-        ),
-        Metadata.HashTag.Hash(
-            type=SHAKE_256_ID,
-            value=SHAKE_256(value)
-        )
-    ]
+    return calculate_hashes_by_stream([value])
 
 
 # Return the configured main service hash on hexadecimal format.
@@ -62,6 +57,23 @@ def get_service_hex_main_hash(
 
     if all_hashes:
         return all_hashes[0].value.hex()
+
+
+def registry_service_id(metadata: Metadata) -> Optional[str]:
+    """The id this node's registry keys ``metadata``'s service by, or None.
+
+    The registry names a service by its digest under the configured hash type
+    (hashing.HASH), so that is the one hash that can be handed to ``nodo get`` /
+    ``nodo execute`` here. Unlike :func:`get_service_hex_main_hash` there is no
+    fallback to another type: for Metadata that came from somewhere else (a chat
+    card, issue #438), an id of the wrong type names nothing in this registry, and
+    None says so instead of guessing.
+    """
+    configured_hash_id = get_configured_hash_id()
+    for hash in metadata.hashtag.hash:
+        if hash.type == configured_hash_id and hash.value:
+            return hash.value.hex()
+    return None
 
 
 def get_service_list_of_hashes(service_buffer: bytes) -> List[Metadata.HashTag.Hash]:

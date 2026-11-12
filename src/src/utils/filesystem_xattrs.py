@@ -4,7 +4,9 @@ import os
 import stat
 import tarfile
 from dataclasses import dataclass
-from typing import Mapping, MutableMapping, Optional
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional
+
+from src.utils import keyvalue
 
 MODE_KEY = "mode"
 UID_KEY = "uid"
@@ -23,6 +25,15 @@ FILESYSTEM_METADATA_KEYS = (
     DEVICE_MINOR_KEY,
     DEVICE_IS_BLOCK_KEY,
 )
+
+# `Filesystem.xattrs` -- the entry list on the tree itself, not on one of its entries.
+# Only the Filesystem referenced directly by `Container.filesystem` is read: a
+# nested one (a subdirectory, reached through `ItemBranch.item.filesystem`) is
+# not separately mounted, so nothing there could be honoured.
+READ_MODE_KEY = "read_mode"
+READ_MODE_RW = "rw"
+READ_MODE_RO = "ro"
+READ_MODES = (READ_MODE_RW, READ_MODE_RO)
 
 
 @dataclass(frozen=True)
@@ -82,18 +93,17 @@ def metadata_from_lstat(stat_result: os.stat_result) -> FilesystemNodeMetadata:
         mode=mode,
         uid=int(stat_result.st_uid),
         gid=int(stat_result.st_gid),
-        # DETERMINISM PATCH (vendored): tar extraction reassigns symlink mtimes
-        # to wall-clock time, which would change the service-id every pack. mtime
-        # is content-irrelevant here, so normalise it to 0. (Report upstream.)
-        mtime_ns=0,
+        mtime_ns=(0 if stat.S_ISLNK(mode) else int(stat_result.st_mtime_ns)),  # tarfile re-stamps symlink mtimes to wall-clock on each extract; regular-file mtimes are restored from the tar and stay deterministic
         device_major=device_major,
         device_minor=device_minor,
         device_is_block=device_is_block,
     )
 
 
-# tarfile.TarInfo.type -> the S_IF* type bits os.stat would report for the same entry
-# (ported from nodo, where this is what keeps the service id independent of who packs).
+# tarfile.TarInfo.type -> the S_IF* type bits os.stat would report for the
+# same entry. LNKTYPE (a tar hardlink) is deliberately mapped like a regular
+# file: that is what it becomes once extracted, and the tar header carries no
+# separate "this is a hardlink" mode bit of its own.
 _TAR_TYPE_TO_S_IFMT = {
     tarfile.REGTYPE: stat.S_IFREG,
     tarfile.AREGTYPE: stat.S_IFREG,
@@ -107,14 +117,21 @@ _TAR_TYPE_TO_S_IFMT = {
 
 
 def metadata_from_tarinfo(tarinfo: tarfile.TarInfo) -> FilesystemNodeMetadata:
-    """Metadata from the tar header, as nodo takes it: the header does not depend on who
-    extracts the tar (uid/gid) nor on when (tarfile re-stamps a symlink's mtime)."""
+    # `tarfile.extractall` only chowns extracted entries to the uid/gid recorded
+    # in the tar when it is running as root; as an unprivileged user every entry
+    # comes out owned by the extracting user instead, silently. Since those
+    # uid/gid values feed the content-addressed service hash, packing the same
+    # image as two different users produced two different ids. The tar header
+    # itself is unaffected by who extracts it, so reading metadata from the
+    # tarfile.TarInfo (this function) instead of from the extracted tree
+    # (metadata_from_lstat) keeps the hash independent of the packer's uid.
     ifmt = _TAR_TYPE_TO_S_IFMT.get(tarinfo.type)
     if ifmt is None:
         raise ValueError(
             f"unsupported tar entry type {tarinfo.type!r} for '{tarinfo.name}'"
         )
     mode = ifmt | (tarinfo.mode & 0o7777)
+
     if tarinfo.type in (tarfile.CHRTYPE, tarfile.BLKTYPE):
         device_major = int(tarinfo.devmajor)
         device_minor = int(tarinfo.devminor)
@@ -123,10 +140,15 @@ def metadata_from_tarinfo(tarinfo: tarfile.TarInfo) -> FilesystemNodeMetadata:
         device_major = 0
         device_minor = 0
         device_is_block = False
+
     return FilesystemNodeMetadata(
         mode=mode,
         uid=int(tarinfo.uid),
         gid=int(tarinfo.gid),
+        # Symlink mtimes are zeroed for the same reason metadata_from_lstat
+        # zeroes them: tarfile re-stamps a symlink's mtime to wall-clock on
+        # each extract, so restoring the tar's own value would not survive a
+        # second extraction on the same host, let alone a different one.
         mtime_ns=0 if ifmt == stat.S_IFLNK else int(tarinfo.mtime) * 1_000_000_000,
         device_major=device_major,
         device_minor=device_minor,
@@ -135,8 +157,11 @@ def metadata_from_tarinfo(tarinfo: tarfile.TarInfo) -> FilesystemNodeMetadata:
 
 
 def implicit_directory_metadata() -> FilesystemNodeMetadata:
-    """A directory that tarfile created only as the parent of a deeper entry (no member of
-    its own in the tar): every packer fabricates the same values for it."""
+    # A directory that tarfile materialized on disk only because a deeper entry
+    # needed it as a parent, with no member of its own in the tar (some tar
+    # writers omit them). Every packer fabricates the same synthetic values for
+    # it, so it stays out of the non-determinism metadata_from_tarinfo exists to
+    # avoid.
     return FilesystemNodeMetadata(
         mode=stat.S_IFDIR | 0o755,
         uid=0,
@@ -148,13 +173,9 @@ def implicit_directory_metadata() -> FilesystemNodeMetadata:
     )
 
 
-def encode_filesystem_metadata_xattrs(
-    xattrs: MutableMapping[str, bytes],
-    metadata: FilesystemNodeMetadata,
-) -> None:
-    # Inserted sorted by key: nodo writes the entries as a sorted list, and the pure-python
-    # protobuf serializes a map in insertion order, so the bytes (and the id) are the same.
-    entries = {
+def filesystem_metadata_xattrs(metadata: FilesystemNodeMetadata) -> Dict[str, bytes]:
+    """The xattrs that carry ``metadata``, ready for ``keyvalue.update``/``from_dict``."""
+    return {
         MODE_KEY: str(metadata.mode).encode("utf-8"),
         UID_KEY: str(metadata.uid).encode("utf-8"),
         GID_KEY: str(metadata.gid).encode("utf-8"),
@@ -163,8 +184,13 @@ def encode_filesystem_metadata_xattrs(
         DEVICE_MINOR_KEY: str(metadata.device_minor).encode("utf-8"),
         DEVICE_IS_BLOCK_KEY: b"1" if metadata.device_is_block else b"0",
     }
-    for key in sorted(entries):
-        xattrs[key] = entries[key]
+
+
+def encode_filesystem_metadata_xattrs(
+    xattrs: MutableMapping[str, bytes],
+    metadata: FilesystemNodeMetadata,
+) -> None:
+    xattrs.update(filesystem_metadata_xattrs(metadata))
 
 
 def parse_filesystem_metadata_xattrs(
@@ -226,6 +252,95 @@ def parse_filesystem_metadata_xattrs(
         device_minor=device_minor,
         device_is_block=device_is_block,
     )
+
+
+def read_mode(filesystem: Any) -> str:
+    """Whether this service asked for a writable rootfs: ``"rw"`` or ``"ro"``.
+
+    Absent is ``"rw"``, which is what every service packed before this key existed
+    declares by saying nothing -- so reading it can never change how an existing
+    service is built.
+
+    Anything else is an integrity error rather than a value to fall back on. The
+    key is what decides whether the node builds a pre-sized ext4 the guest can
+    write to or an immutable image it cannot, and a typo resolved to a default is
+    a service silently built the other way round from the one its author meant.
+
+    Read only from the tree's own ``xattrs``; pass the Filesystem that
+    ``Container.filesystem`` points at, not one of its subdirectories.
+    """
+    xattrs = keyvalue.to_dict(getattr(filesystem, "xattrs", None) or [])
+    if READ_MODE_KEY not in xattrs:
+        return READ_MODE_RW
+
+    raw = xattrs[READ_MODE_KEY]
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    try:
+        value = bytes(raw).decode("utf-8").strip()
+    except Exception as e:
+        raise ValueError(f"{READ_MODE_KEY} is not valid UTF-8 bytes") from e
+
+    if value not in READ_MODES:
+        raise ValueError(
+            f"unsupported {READ_MODE_KEY} '{value}': expected one of "
+            + ", ".join(READ_MODES)
+        )
+    return value
+
+
+def missing_metadata_keys(xattrs: Mapping[str, bytes]) -> List[str]:
+    """Which of :data:`FILESYSTEM_METADATA_KEYS` this entry does not carry."""
+    return [key for key in FILESYSTEM_METADATA_KEYS if key not in xattrs]
+
+
+def assert_complete_filesystem_metadata(
+    filesystem: Any,
+    parent_rel_path: str = "/",
+) -> None:
+    """Refuse a tree that does not declare mode/uid/gid/mtime/device for every entry.
+
+    The metadata keys are optional everywhere else: an entry that carries none of
+    them falls back to a legacy heuristic that sniffs shebangs and ELF magic to
+    guess an executable bit. That heuristic is enough for a writable image, where
+    whatever it got wrong can still be fixed from inside the guest, and it is the
+    only thing services packed before the metadata contract existed have.
+
+    It is not enough for an image with no writable escape hatch. It cannot restore
+    a uid or a gid -- it does not read them -- and it cannot produce a device node
+    at all, so a tree relying on it would be mounted read-only with ownership and
+    device nodes it never declared and now cannot repair. So for ``read_mode=ro``
+    the keys stop being optional, and a tree missing any of them is refused at
+    build time with the path that is missing them, rather than booted wrong.
+
+    Recursive: the gate is about what ends up in the image, and a subdirectory's
+    entries end up in it just as much as the root's.
+    """
+    for branch in getattr(filesystem, "branch", []) or []:
+        name = getattr(branch, "name", "") or ""
+        rel_path = (
+            f"{parent_rel_path.rstrip('/')}/{name}" if name else parent_rel_path
+        )
+
+        missing = missing_metadata_keys(keyvalue.to_dict(getattr(branch, "xattrs", None) or []))
+        if missing:
+            raise ValueError(
+                f"incomplete filesystem metadata at '{rel_path}': missing "
+                + ", ".join(sorted(missing))
+                + f". A {READ_MODE_KEY}={READ_MODE_RO} service must declare "
+                + ", ".join(FILESYSTEM_METADATA_KEYS)
+                + " on every entry: the image it is built into cannot be corrected "
+                "from inside the guest."
+            )
+
+        nested = None
+        try:
+            if branch.HasField("filesystem"):
+                nested = branch.filesystem
+        except (AttributeError, ValueError):
+            nested = None
+        if nested is not None:
+            assert_complete_filesystem_metadata(nested, parent_rel_path=rel_path)
 
 
 def _parse_utf8_int(key: str, value: bytes) -> int:

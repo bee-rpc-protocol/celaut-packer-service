@@ -1,4 +1,0 @@
-{
-    "include": ["src", "requirements.txt", "start.sh", ".service/pack_config.json"],
-    "ignore": ["tests/", "*.pyc", "__pycache__/", "*.md", ".env"]
-}

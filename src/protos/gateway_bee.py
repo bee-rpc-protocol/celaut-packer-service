@@ -1,3 +1,7 @@
+from typing import Dict, Final, NamedTuple
+
+from bee_rpc import buffer_pb2
+
 from protos import celaut_pb2, pack_pb2
 
 StartService_input_indices = {
@@ -7,8 +11,23 @@ StartService_input_indices = {
     4: celaut_pb2.Metadata.HashTag.Hash,
     5: celaut_pb2.Metadata,
     6: celaut_pb2.Service,
+    7: celaut_pb2.StartReference,
 }
-StartService_input_message_mode = {1: True, 2: True, 3: True, 4: True, 5: True, 6: False}  # False yield a Dir.
+StartService_input_message_mode = {1: True, 2: True, 3: True, 4: True, 5: True, 6: False, 7: True}  # False yield a Dir.
+
+# GetService answers with the StartService envelope's 4/5/6 (see GATEWAY_RPCS), and
+# bee-rpc wants a message mode for exactly the indices it parses: the Service, index 6,
+# is stored as a Dir.
+GetService_output_message_mode = {4: True, 5: True, 6: False}
+
+# GenerateClient answers with one of two messages (issue #361), so both ends need the
+# same index for each: bee-rpc numbers a lone message 1 by itself, which would put a
+# Client and a PoWRequired on the same index and leave the caller unable to tell which
+# it received.
+GenerateClient_output_indices = {
+    1: celaut_pb2.Client,
+    2: celaut_pb2.PoWRequired,
+}
 
 PackOutput_indices = {
     1: pack_pb2.PackOutputServiceId,
@@ -16,3 +35,180 @@ PackOutput_indices = {
     3: pack_pb2.Service,
     4: pack_pb2.PackOutputError
 }
+
+
+# ---------------------------------------------------------------------------------
+# What each Gateway RPC carries, in one place.
+#
+# Every Gateway RPC has the same gRPC signature (a stream of buffer.Buffer each way),
+# so what a method actually takes and returns is not in celaut.proto at all: it is
+# which message type bee-rpc carries at which head index, in each direction. Both ends
+# have to agree on it byte for byte, which makes it protocol -- and it is declared as
+# such in what every address announces (src/identity/transport_stack.py, the
+# celaut-gateway layer), built from the table below. The server (src/gateway) and the
+# client (src/utils/bee_client.py) read it from here too, so the three cannot drift.
+#
+# ``auth`` is how the method identifies its caller:
+#   client             a Client at index 2 next to the payload at 1 (client_gate)
+#   client-in-message  a client_id inside the payload itself (Chat)
+#   token              a bearer token inside the payload (an instance token)
+#   token+client       an instance token in the payload and a Client at index 2. The
+#                      Client is read only when the instance's father is a client: then
+#                      it must be that father (client_gate.require_father). Any other
+#                      father -- an instance, a node -- leaves the token as the only
+#                      credential
+#   local-address      the caller's address must be a local instance of the node
+#                      (no RPC uses it alone now; ModifyServiceSystemResources falls back
+#                      to it when the payload has no token)
+#   none               nobody is identified (GenerateClient, which mints the Client)
+# ---------------------------------------------------------------------------------
+
+class GatewayRpc(NamedTuple):
+    input: Dict[int, type]
+    output: Dict[int, type]
+    auth: str
+
+
+AUTH_KINDS: Final = ("client", "client-in-message", "token", "token+client", "local-address", "none")
+
+GATEWAY_RPCS: Final[Dict[str, GatewayRpc]] = {
+    "StartService": GatewayRpc(
+        input=StartService_input_indices,
+        output={1: celaut_pb2.ServiceInstance},
+        auth="client",
+    ),
+    "StopService": GatewayRpc(
+        input={1: celaut_pb2.TokenMessage, 2: celaut_pb2.Client},
+        output={1: celaut_pb2.Refund},
+        auth="token+client",
+    ),
+    "ModifyDeposit": GatewayRpc(
+        input={1: celaut_pb2.ModifyDepositInput, 2: celaut_pb2.Client},
+        output={1: celaut_pb2.ModifyDepositOutput},
+        auth="token+client",
+    ),
+    "GetPeerInfo": GatewayRpc(
+        input={1: celaut_pb2.Client},
+        output={1: celaut_pb2.Peer},
+        auth="client",
+    ),
+    "ListPeers": GatewayRpc(
+        input={1: celaut_pb2.Client},
+        output={1: celaut_pb2.Peer},
+        auth="client",
+    ),
+    "ResolveNetwork": GatewayRpc(
+        input={1: celaut_pb2.Service.Network, 2: celaut_pb2.Client},
+        output={1: celaut_pb2.ConfigurationFile.NetworkResolution},
+        auth="client",
+    ),
+    "LocateShare": GatewayRpc(
+        input={1: celaut_pb2.ShareLocationRequest, 2: celaut_pb2.Client},
+        output={1: celaut_pb2.ShareLocation},
+        auth="client",
+    ),
+    "IntroducePeer": GatewayRpc(
+        input={1: celaut_pb2.Peer, 2: celaut_pb2.Client},
+        output={1: celaut_pb2.RecursionGuard},
+        auth="client",
+    ),
+    "GenerateClient": GatewayRpc(
+        input={1: celaut_pb2.Client},
+        output=GenerateClient_output_indices,
+        auth="none",
+    ),
+    "AssociateClient": GatewayRpc(
+        input={1: celaut_pb2.Client},
+        output={1: celaut_pb2.AssociateClientOutput},
+        auth="client",
+    ),
+    "GenerateDepositToken": GatewayRpc(
+        input={1: celaut_pb2.Client},
+        output={1: celaut_pb2.TokenMessage},
+        auth="client",
+    ),
+    "Payable": GatewayRpc(
+        input={1: celaut_pb2.Payment, 2: celaut_pb2.Client},
+        output={1: buffer_pb2.Empty},
+        auth="client",
+    ),
+    "ModifyServiceSystemResources": GatewayRpc(
+        input={1: celaut_pb2.ModifyServiceSystemResourcesInput, 2: celaut_pb2.Client},
+        output={1: celaut_pb2.ModifyServiceSystemResourcesOutput},
+        auth="token+client",
+    ),
+    "GetServiceEstimatedCost": GatewayRpc(
+        input=StartService_input_indices,
+        output={1: celaut_pb2.EstimatedCost},
+        auth="client",
+    ),
+    "GetResourceAvailability": GatewayRpc(
+        input={1: celaut_pb2.ResourceAvailabilityRequest, 2: celaut_pb2.Client},
+        output={1: celaut_pb2.ResourceAvailability},
+        auth="client",
+    ),
+    "GetService": GatewayRpc(
+        input={1: celaut_pb2.Metadata.HashTag.Hash, 2: celaut_pb2.Client},
+        # The StartService envelope's own indices, so what GetService returns can be
+        # handed to StartService unchanged.
+        output={
+            4: celaut_pb2.Metadata.HashTag.Hash,
+            5: celaut_pb2.Metadata,
+            6: celaut_pb2.Service,
+        },
+        auth="client",
+    ),
+    "GetMetrics": GatewayRpc(
+        input={1: celaut_pb2.TokenMessage},
+        output={1: celaut_pb2.Metrics},
+        auth="token",
+    ),
+    "GetClientMetrics": GatewayRpc(
+        input={1: celaut_pb2.Client},
+        output={1: celaut_pb2.Metrics},
+        auth="client",
+    ),
+    "GetBalanceStatement": GatewayRpc(
+        input={1: celaut_pb2.BalanceStatementRequest, 2: celaut_pb2.Client},
+        output={1: celaut_pb2.BalanceStatement},
+        auth="client",
+    ),
+    "ServiceTunnel": GatewayRpc(
+        # Index 2 in place of index 1 for a tunnel to a descendant (#631). An older node
+        # refuses an index that it does not know, so it never opens the wrong instance.
+        input={1: celaut_pb2.TokenMessage, 2: celaut_pb2.DescendantTunnel, 0: bytes},
+        # Index 2 only for a caller that set TokenMessage.receipts (#419): an older
+        # client refuses an index it does not know, so the node never sends it unasked.
+        output={0: bytes, 2: celaut_pb2.ExecutionReceipt},
+        auth="token",
+    ),
+    "Observe": GatewayRpc(
+        input={1: celaut_pb2.ObserveRequest},
+        output={1: celaut_pb2.ObserveEvent},
+        auth="token",
+    ),
+    "Chat": GatewayRpc(
+        input={1: celaut_pb2.ChatMessage},
+        output={1: celaut_pb2.ChatAck},
+        auth="client-in-message",
+    ),
+    "GetChatThread": GatewayRpc(
+        input={1: celaut_pb2.ChatThreadRequest, 2: celaut_pb2.Client},
+        output={1: celaut_pb2.ChatThread},
+        auth="client",
+    ),
+}
+
+
+def rpc_input(method: str) -> Dict[int, type]:
+    """A fresh copy of ``method``'s request indices.
+
+    A copy because bee_rpc writes into the dict it is handed (it adds ``0: bytes``),
+    so passing the table itself would change it for every later call.
+    """
+    return dict(GATEWAY_RPCS[method].input)
+
+
+def rpc_output(method: str) -> Dict[int, type]:
+    """A fresh copy of ``method``'s response indices. See :func:`rpc_input`."""
+    return dict(GATEWAY_RPCS[method].output)
