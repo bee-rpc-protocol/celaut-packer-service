@@ -1,5 +1,5 @@
 {
-  "tag": ["celaut-packer-service", "packer", "v0.3.0"],
+  "tag": ["celaut-packer-service", "packer", "v0.3.1"],
   "architecture": "linux/amd64",
   "uses_gateway": true,
   "init": {
